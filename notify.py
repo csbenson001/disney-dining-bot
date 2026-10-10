@@ -213,6 +213,13 @@ def send_sms(slots: List[Slot]) -> SendResult:
     if not slots:
         return SendResult([], [])
 
+    try:
+        import supabase_pipe
+        if supabase_pipe.is_supabase_enabled():
+            supabase_pipe.pipe_slots_to_supabase(slots, booking_url)
+    except Exception as exc:
+        print(f'[notify] Supabase pipe failed: {exc}')
+
     by_recipient = defaultdict(list)
     fallback_to = os.environ.get("TWILIO_TO", "")
     for slot in slots:

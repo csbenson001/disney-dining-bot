@@ -178,6 +178,26 @@ def load_watches(owner_id: Optional[str] = None, include_expired: bool = False) 
         watches = [w for w in watches if is_active_watch(w, today)]
     if owner_id:
         watches = [w for w in watches if w["owner_id"] == owner_id]
+
+    try:
+        import supabase_pipe
+        if supabase_pipe.is_supabase_enabled():
+            for target in supabase_pipe.sync_plans_from_supabase():
+                for d in target.get("dates", []):
+                    w_norm = _normalize_watch({
+                        "owner_id": default_owner_id(),
+                        "facility_id": target["facility_id"],
+                        "name": target.get("name"),
+                        "slug": target.get("slug"),
+                        "party_size": target.get("party_size", 2),
+                        "meal_periods": target.get("meal_periods", ["ALL"]),
+                        "date": d,
+                    })
+                    if not any(w["facility_id"] == w_norm["facility_id"] and w["date"] == w_norm["date"] and w["party_size"] == w_norm["party_size"] for w in watches):
+                        watches.append(w_norm)
+    except Exception as exc:
+        print(f'[watch_store] Supabase plan sync failed: {exc}')
+
     return sorted(watches, key=lambda w: (w["owner_id"], w["name"], w["date"], w["party_size"]))
 
 
