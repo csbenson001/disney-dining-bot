@@ -10,3 +10,4 @@ twilio>=9.0
 schedule>=1.2
 requests>=2.31
 playwright>=1.45
+tzdata
