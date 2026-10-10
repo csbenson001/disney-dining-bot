@@ -227,6 +227,50 @@ def sync_plans_from_supabase() -> List[Dict[str, Any]]:
                 if dine_date and dine_date not in targets_by_facility[fac_id]["dates"]:
                     targets_by_facility[fac_id]["dates"].append(dine_date)
 
+        # Also check active watches with threshold_json->kind = ADR
+        try:
+            r_w = requests.get(
+                f"{SUPABASE_URL}/rest/v1/watches?status=eq.active&select=entity_id,threshold_json",
+                headers=_headers(),
+                timeout=8,
+            )
+            if r_w.status_code == 200 and r_w.json():
+                for w in r_w.json():
+                    tj = w.get("threshold_json") or {}
+                    if (tj.get("kind") == "ADR" or tj.get("date")) and tj.get("date"):
+                        e_id = w.get("entity_id")
+                        if not e_id:
+                            continue
+                        r_ent = requests.get(
+                            f"{SUPABASE_URL}/rest/v1/entities?id=eq.{e_id}&select=external_id,name,booking_url&limit=1",
+                            headers=_headers(),
+                            timeout=8,
+                        )
+                        if r_ent.status_code == 200 and r_ent.json():
+                            ent = r_ent.json()[0]
+                            fac_id = ent.get("external_id")
+                            if not fac_id:
+                                continue
+                            dine_date = tj.get("date")
+                            party_size = tj.get("party_size", 2)
+                            slug = (ent.get("booking_url") or "").rstrip("/").split("/")[-1]
+                            mp = tj.get("meal_period")
+                            periods = [mp] if mp and mp != "ALL" else ["BREAKFAST", "LUNCH", "DINNER"]
+
+                            if fac_id not in targets_by_facility:
+                                targets_by_facility[fac_id] = {
+                                    "name": ent["name"],
+                                    "facility_id": fac_id,
+                                    "slug": slug,
+                                    "party_size": party_size,
+                                    "dates": [],
+                                    "meal_periods": periods,
+                                }
+                            if dine_date and dine_date not in targets_by_facility[fac_id]["dates"]:
+                                targets_by_facility[fac_id]["dates"].append(dine_date)
+        except Exception as e_w:
+            print(f"[supabase_pipe] error syncing watches from Supabase: {e_w}")
+
         return list(targets_by_facility.values())
     except Exception as e:
         print(f"[supabase_pipe] error syncing plans from Supabase: {e}")
