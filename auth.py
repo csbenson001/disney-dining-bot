@@ -131,18 +131,32 @@ def save_tokens(tokens: dict) -> None:
 
 def _do_refresh(tokens: dict) -> dict:
     """POST to Disney's refreshAuth endpoint and return updated tokens dict."""
-    from curl_cffi import requests as cffi_requests
-    resp = cffi_requests.post(
-        REFRESH_URL,
-        headers={
-            "Authorization": f"BEARER {tokens['access_token']}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={"refreshToken": tokens["refresh_token"]},
-        impersonate="chrome120",
-        timeout=15,
-    )
+    try:
+        from curl_cffi import requests as cffi_requests
+        resp = cffi_requests.post(
+            REFRESH_URL,
+            headers={
+                "Authorization": f"BEARER {tokens['access_token']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json={"refreshToken": tokens["refresh_token"]},
+            impersonate="chrome120",
+            timeout=15,
+        )
+    except ImportError:
+        import requests
+        resp = requests.post(
+            REFRESH_URL,
+            headers={
+                "Authorization": f"BEARER {tokens['access_token']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+            json={"refreshToken": tokens["refresh_token"]},
+            timeout=15,
+        )
     if resp.status_code != 200:
         body_preview = (resp.text or "")[:600]
         print(

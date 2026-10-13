@@ -1,0 +1,16 @@
+[Unit]
+Description=Disney Autonomous Booking Daemon (autobook_service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/disney-dining-bot
+Environment=PROJECT_DIR=/opt/disney-dining-bot
+Environment=PATH=/opt/disney-dining-bot/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/disney-dining-bot/.venv/bin/uvicorn autobook_service:app --host 0.0.0.0 --port 8089
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

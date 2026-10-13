@@ -49,6 +49,8 @@ def booking_url(slot: Slot) -> str:
         # Enchanting Extras experiences book through their own flow; there is
         # no per-offer deep link.
         return f"https://disneyworld.disney.go.com/enchanting-extras-collection/{slug}/"
+    if slot.party_size and slot.date:
+        return f"{BOOK_BASE}/{slug}/{slot.party_size}/{slot.date}/"
     return f"{BOOK_BASE}/{slug}/"
 
 
