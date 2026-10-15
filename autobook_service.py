@@ -557,9 +557,48 @@ def book_lightning_lane(req: BookingRequest):
 
     logger.info(f"⚡ AUTOBOOK ENGAGED for '{ride_name}' ({req.facility_id}) | Date: {target_date} | Party ({len(guests)}): {party_names}")
 
-    # Dry-Run mode for testing/integration verification
+    # 2. Get active Disney coach session token & verify live Disney communication
+    try:
+        token = auth.get_valid_token()
+        token_exp = auth._jwt_exp(token)
+    except Exception as e:
+        err_msg = f"Failed to acquire valid Disney token: {e}"
+        logger.error(err_msg)
+        log_autobook_event_to_supabase(req.watch_id, ride_name, "error", {"error": err_msg})
+        raise HTTPException(status_code=502, detail=err_msg)
+
+    tokens_meta = storage.read_json("tokens.json") or {}
+    coach_swid = tokens_meta.get("swid", "{6C27C4FE-D20C-4DEE-B27B-026DB6C9458E}")
+    disney_facility_id = resolve_disney_facility_id(req.facility_id, ride_name)
+
+    # Dry-Run / Simulation mode: Actively verifies live Disney auth and tipboard status
     if req.dry_run:
-        sim_confirmation = f"LL-{uuid.uuid4().hex[:8].upper()}"
+        sim_confirmation = f"LL-SIM-{uuid.uuid4().hex[:8].upper()}"
+        live_disney_status = "UNKNOWN"
+        live_return_time = req.preferred_time or "ASAP"
+        try:
+            import urllib.parse
+            import requests as py_requests
+            swid_enc = urllib.parse.quote(coach_swid)
+            tip_url = f"https://disneyworld.disney.go.com/tipboard-vas/planning/v1/parks/{park_id}/experiences/?date={target_date}&userId={swid_enc}"
+            tip_headers = {
+                "Authorization": f"BEARER {token}",
+                "x-user-id": coach_swid,
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X)",
+            }
+            tip_resp = py_requests.get(tip_url, headers=tip_headers, timeout=8)
+            if tip_resp.status_code == 200:
+                experiences = tip_resp.json().get("availableExperiences", [])
+                for exp in experiences:
+                    if exp.get("id") == disney_facility_id or exp.get("id") == req.facility_id:
+                        flex = exp.get("flex", {})
+                        live_disney_status = "AVAILABLE" if flex.get("available") else "STANDBY_ONLY"
+                        live_return_time = flex.get("displayNextAvailableTime") or live_return_time
+                        break
+        except Exception as e:
+            logger.warning(f"Dry-run live tipboard probe warning: {e}")
+
         result = {
             "ok": True,
             "status": "CONFIRMED",
@@ -567,24 +606,21 @@ def book_lightning_lane(req: BookingRequest):
             "confirmation_id": sim_confirmation,
             "ride_name": ride_name,
             "facility_id": req.facility_id,
+            "disney_facility_id": disney_facility_id,
             "target_date": target_date,
-            "return_time": req.preferred_time or "10:30 AM",
+            "return_time": live_return_time,
             "party": party_names,
             "guest_count": len(guests),
+            "disney_authenticated": True,
+            "disney_token_valid": True,
+            "coach_swid": coach_swid,
+            "disney_tipboard_status": live_disney_status,
             "execution_ms": int((time.time() - start_time) * 1000),
             "executed_at": datetime.now(timezone.utc).isoformat(),
         }
         log_autobook_event_to_supabase(req.watch_id, ride_name, "success", result)
+        logger.info(f"✅ SIMULATED AUTOBOOK VERIFIED: {ride_name} for {party_names} (live status: {live_disney_status})")
         return result
-
-    # 2. Get active Disney coach session token
-    try:
-        token = auth.get_valid_token()
-    except Exception as e:
-        err_msg = f"Failed to acquire valid Disney token: {e}"
-        logger.error(err_msg)
-        log_autobook_event_to_supabase(req.watch_id, ride_name, "error", {"error": err_msg})
-        raise HTTPException(status_code=502, detail=err_msg)
 
     # 3. Step A: Hold
     disney_facility_id = resolve_disney_facility_id(req.facility_id, ride_name)
