@@ -21,7 +21,7 @@ import storage  # noqa: E402
 
 CLIENT_ID = "TPR-WDW-LBJS.WEB-PROD"
 REFRESH_URL = (
-    f"https://auth.registerdisney.go.com/v4/client/{CLIENT_ID}/guest/refreshAuth"
+    f"https://registerdisney.go.com/jgc/v8/client/{CLIENT_ID}/guest/refresh-auth"
 )
 REFRESH_AHEAD_SECS = 600  # refresh only when access token has <10 min remaining
 MIN_USABLE_TOKEN_SECS = 60  # access token must have >60s left to be usable as a fallback
@@ -168,24 +168,32 @@ def _do_refresh(tokens: dict) -> dict:
         )
     body = resp.json()
 
-    # Disney has returned several different shapes over the years — handle both
+    # Disney jgc/v8 returns {"data": {"token": {"access_token": ..., "refresh_token": ...}}}
+    token_obj = (body.get("data") or {}).get("token") or body.get("token") or body
+
     new_access = (
-        body.get("access_token")
-        or body.get("accessToken")
-        or (body.get("data") or {}).get("access_token")
+        token_obj.get("access_token")
+        or token_obj.get("accessToken")
         or ""
     )
     new_refresh = (
-        body.get("refresh_token")
-        or body.get("refreshToken")
-        or (body.get("data") or {}).get("refresh_token")
+        token_obj.get("refresh_token")
+        or token_obj.get("refreshToken")
         or tokens["refresh_token"]  # keep old one if not rotated
     )
+    swid = token_obj.get("swid") or tokens.get("swid", "")
+
     if not new_access:
         raise RuntimeError(
             f"Refresh response had no access_token.  Keys: {list(body.keys())}"
         )
-    return {"access_token": new_access, "refresh_token": new_refresh}
+    return {
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "swid": swid,
+        "account_email": tokens.get("account_email", "wdwridecoach@gmail.com"),
+        "updated_at": time.time(),
+    }
 
 
 def get_valid_token() -> str:

@@ -260,6 +260,47 @@ def get_disney_headers(token: str) -> Dict[str, str]:
     }
 
 
+FACILITY_ID_MAPPING: Dict[str, str] = {
+    "480fde8f-fe58-4bfb-b3ab-052a39d4db7c": "80010191",  # Spaceship Earth
+}
+
+RIDE_NAME_TO_FACILITY: Dict[str, str] = {
+    "spaceship earth": "80010191",
+    "test track": "80010199",
+    "guardians": "19515082",
+    "cosmic rewind": "19515082",
+    "remy": "19515081",
+    "frozen": "18375495",
+    "soarin": "80010208",
+    "space mountain": "80010179",
+    "seven dwarfs": "17502476",
+    "mine train": "17502476",
+    "tron": "19515084",
+    "big thunder": "80010110",
+    "peter pan": "80010168",
+    "tiana": "80010178",
+    "haunted mansion": "80010137",
+    "rise of the resistance": "19327195",
+    "slinky": "18873096",
+    "tower of terror": "80010214",
+    "flight of passage": "18665275",
+    "expedition everest": "80010129",
+    "safari": "80010150",
+}
+
+
+def resolve_disney_facility_id(facility_id: str, ride_name: str) -> str:
+    if facility_id in FACILITY_ID_MAPPING:
+        return FACILITY_ID_MAPPING[facility_id]
+    if facility_id and facility_id.isdigit():
+        return facility_id
+    low = (ride_name or "").lower()
+    for hint, fid in RIDE_NAME_TO_FACILITY.items():
+        if hint in low:
+            return fid
+    return facility_id
+
+
 def infer_park_id(facility_id: str, ride_name: str, park_id: Optional[str]) -> str:
     if park_id and park_id.isdigit():
         return park_id
@@ -546,13 +587,14 @@ def book_lightning_lane(req: BookingRequest):
         raise HTTPException(status_code=502, detail=err_msg)
 
     # 3. Step A: Hold
+    disney_facility_id = resolve_disney_facility_id(req.facility_id, ride_name)
     try:
         hold_res = execute_disney_hold(
             token=token,
             target_date=target_date,
             guest_ids=guest_ids,
             park_id=park_id,
-            facility_id=req.facility_id,
+            facility_id=disney_facility_id,
             preferred_time=req.preferred_time,
         )
     except Exception as e:

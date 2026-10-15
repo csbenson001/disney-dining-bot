@@ -88,6 +88,7 @@ def main():
     parser.add_argument("--password", default=os.environ.get("DISNEY_LOGIN_PASSWORD", "Christo123!"))
     parser.add_argument("--profile-dir", default=str(Path(__file__).parent / ".coach_profile"))
     parser.add_argument("--timeout-sec", type=int, default=120, help="Max seconds to wait for login completion")
+    parser.add_argument("--otp", default=None, help="6-digit verification code sent to email")
     args = parser.parse_args()
 
     print(f"=== WDW Ride Coach Disney Authenticator ===")
@@ -275,8 +276,38 @@ def main():
 
                 if otp_found:
                     page.screenshot(path=str(SCREENSHOTS_DIR / "otp_required.png"))
-                    if args.headless:
-                        print("[NOTICE] Running headless and OTP requested. Please switch to headed mode or check email.")
+                    # Check for OTP code from args or file
+                    otp_code = (args.otp or "").strip()
+                    otp_file = Path(__file__).parent / "otp_code.txt"
+                    if not otp_code and otp_file.exists():
+                        try:
+                            otp_code = otp_file.read_text().strip()
+                        except Exception:
+                            pass
+
+                    if otp_code and len(otp_code) == 6 and otp_code.isdigit():
+                        print(f"[OTP] Entering 6-digit code {otp_code}...")
+                        inputs = fr.locator("input:visible").all()
+                        if len(inputs) == 6:
+                            for idx, digit in enumerate(otp_code):
+                                inputs[idx].fill(digit)
+                                page.wait_for_timeout(100)
+                        elif len(inputs) >= 1:
+                            inputs[0].fill(otp_code)
+
+                        page.wait_for_timeout(500)
+                        cont_btn = fr.locator("button:has-text('Continue'), button#BtnSubmit, button[type='submit']").first
+                        if cont_btn.is_visible(timeout=2000):
+                            print("[OTP] Clicking Continue...")
+                            cont_btn.click()
+                        else:
+                            page.keyboard.press("Enter")
+                        page.wait_for_timeout(4000)
+                        if otp_file.exists():
+                            otp_file.unlink(missing_ok=True)
+                        args.otp = None  # Consume once
+                    elif args.headless:
+                        print("[NOTICE] Running headless and OTP requested. Please switch to headed mode or provide OTP code.")
                         break
 
                 page.wait_for_timeout(2000)
