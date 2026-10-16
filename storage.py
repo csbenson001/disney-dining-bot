@@ -73,7 +73,28 @@ def write_text(filename: str, content: str) -> None:
         (_ROOT / filename).write_text(content)
 
 
+def _supabase_config() -> tuple:
+    url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    return url, key
+
+
 def read_json(filename: str, default: Any = None) -> Any:
+    # Check Supabase app_config for tokens.json first
+    if filename == "tokens.json":
+        url, key = _supabase_config()
+        if url and key:
+            try:
+                headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+                r = _req.get(f"{url}/rest/v1/app_config?key=eq.coach_tokens", headers=headers, timeout=5)
+                if r.status_code == 200:
+                    rows = r.json()
+                    if rows and rows[0].get("value"):
+                        val = rows[0]["value"]
+                        return json.loads(val) if isinstance(val, str) else val
+            except Exception:
+                pass
+
     text = read_text(filename)
     if not text:
         return default
@@ -84,6 +105,22 @@ def read_json(filename: str, default: Any = None) -> Any:
 
 
 def write_json(filename: str, data: Any) -> None:
+    # Also persist tokens.json to Supabase app_config
+    if filename == "tokens.json":
+        url, key = _supabase_config()
+        if url and key:
+            try:
+                headers = {
+                    "apikey": key,
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates",
+                }
+                payload = {"key": "coach_tokens", "value": data}
+                _req.post(f"{url}/rest/v1/app_config", headers=headers, json=payload, timeout=5)
+            except Exception:
+                pass
+
     write_text(filename, json.dumps(data, indent=2))
 
 
