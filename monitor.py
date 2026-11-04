@@ -179,7 +179,8 @@ def _token_state_from_saved_tokens() -> DisneyTokenState:
     try:
         tokens = auth.load_tokens()
     except Exception as exc:
-        return DisneyTokenState(source="tokens.json", error=f"saved token load failed: {type(exc).__name__}")
+        print(f"[auth-debug] auth.load_tokens() raised: {exc}")
+        return DisneyTokenState(source="tokens.json", error=f"saved token load failed: {type(exc).__name__}: {exc}")
     access = _strip_bearer(tokens.get("access_token", ""))
     return DisneyTokenState(
         access_token=access,
