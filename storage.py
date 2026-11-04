@@ -91,9 +91,13 @@ def read_json(filename: str, default: Any = None) -> Any:
                     rows = r.json()
                     if rows and rows[0].get("value"):
                         val = rows[0]["value"]
-                        return json.loads(val) if isinstance(val, str) else val
-            except Exception:
-                pass
+                        loaded = json.loads(val) if isinstance(val, str) else val
+                        print(f"[storage] Loaded {filename} directly from Supabase app_config.")
+                        return loaded
+                else:
+                    print(f"[storage] Supabase app_config returned status {r.status_code}: {r.text[:100]}")
+            except Exception as exc:
+                print(f"[storage] Supabase token fetch failed: {exc}")
 
     text = read_text(filename)
     if not text:
