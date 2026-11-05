@@ -14,7 +14,7 @@ Signal regardless of which code path triggered it.
 import os
 import subprocess
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -39,6 +39,16 @@ SIGNAL_SEND_TIMEOUT = 60  # seconds; signal-cli send is usually <5s but pad for 
 class SendResult:
     sent_slots: List[Slot]
     errors: List[str]
+    receipts: List["DeliveryReceipt"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    recipient: str
+    provider: str
+    status: str
+    message_id: Optional[str] = None
+    error: Optional[str] = None
 
 
 def booking_url(slot: Slot) -> str:
@@ -49,8 +59,6 @@ def booking_url(slot: Slot) -> str:
         # Enchanting Extras experiences book through their own flow; there is
         # no per-offer deep link.
         return f"https://disneyworld.disney.go.com/enchanting-extras-collection/{slug}/"
-    if slot.party_size and slot.date:
-        return f"{BOOK_BASE}/{slug}/{slot.party_size}/{slot.date}/"
     return f"{BOOK_BASE}/{slug}/"
 
 
@@ -88,13 +96,13 @@ def _classify(recipient: str) -> Tuple[str, str]:
     return "sms", r
 
 
-def _send_via_signal(to_number: str, body: str) -> Optional[str]:
-    """Send a Signal message via local signal-cli. Returns None on success, error string on failure."""
+def _send_via_signal(to_number: str, body: str) -> DeliveryReceipt:
+    """Send a Signal message and return the provider acknowledgement."""
     bot_number = os.environ.get("SIGNAL_BOT_NUMBER", "").strip()
     if not bot_number:
-        return "SIGNAL_BOT_NUMBER not set in .env"
+        return DeliveryReceipt(to_number, "signal", "failed", error="SIGNAL_BOT_NUMBER not set in .env")
     if not os.path.exists(SIGNAL_CLI_PATH):
-        return f"signal-cli not found at {SIGNAL_CLI_PATH}"
+        return DeliveryReceipt(to_number, "signal", "failed", error=f"signal-cli not found at {SIGNAL_CLI_PATH}")
     try:
         result = subprocess.run(
             [SIGNAL_CLI_PATH, "-a", bot_number, "send", "-m", body, to_number],
@@ -103,17 +111,20 @@ def _send_via_signal(to_number: str, body: str) -> Optional[str]:
             timeout=SIGNAL_SEND_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return f"signal-cli timed out after {SIGNAL_SEND_TIMEOUT}s sending to {to_number}"
+        error = f"signal-cli timed out after {SIGNAL_SEND_TIMEOUT}s sending to {to_number}"
+        return DeliveryReceipt(to_number, "signal", "failed", error=error)
     except Exception as exc:
-        return f"signal-cli crashed sending to {to_number}: {type(exc).__name__}: {exc}"
+        error = f"signal-cli crashed sending to {to_number}: {type(exc).__name__}: {exc}"
+        return DeliveryReceipt(to_number, "signal", "failed", error=error)
 
     if result.returncode != 0:
         err_tail = (result.stderr or result.stdout or "").strip()[-300:]
-        return f"signal-cli exit {result.returncode} sending to {to_number}: {err_tail}"
+        error = f"signal-cli exit {result.returncode} sending to {to_number}: {err_tail}"
+        return DeliveryReceipt(to_number, "signal", "failed", error=error)
 
     timestamp = (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
     print(f"[notify] Signal message delivered to {to_number}. {timestamp}")
-    return None
+    return DeliveryReceipt(to_number, "signal", "delivered", message_id=timestamp or None)
 
 
 _twilio_client: Optional[Client] = None
@@ -131,7 +142,7 @@ def _twilio() -> Optional[Client]:
     return _twilio_client
 
 
-def _send_via_twilio(to_recipient_with_prefix: str, body: str, channel: str) -> Optional[str]:
+def _send_via_twilio(to_recipient_with_prefix: str, body: str, channel: str) -> DeliveryReceipt:
     """Send via Twilio. to_recipient_with_prefix retains any channel prefix Twilio expects.
 
     For SMS, prefer TWILIO_MESSAGING_SERVICE_SID (required for US A2P 10DLC
@@ -143,9 +154,12 @@ def _send_via_twilio(to_recipient_with_prefix: str, body: str, channel: str) -> 
     """
     client = _twilio()
     if client is None:
-        return "Twilio credentials not set"
+        return DeliveryReceipt(to_recipient_with_prefix, "twilio", "failed", error="Twilio credentials not set")
 
     create_kwargs = {"body": body, "to": to_recipient_with_prefix}
+    status_callback_url = os.environ.get("TWILIO_STATUS_CALLBACK_URL", "").strip()
+    if status_callback_url:
+        create_kwargs["status_callback"] = status_callback_url
     if channel == "sms":
         messaging_service_sid = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "").strip()
         if messaging_service_sid:
@@ -153,27 +167,34 @@ def _send_via_twilio(to_recipient_with_prefix: str, body: str, channel: str) -> 
         else:
             from_number = os.environ.get("TWILIO_FROM", "").strip()
             if not from_number:
-                return "Neither TWILIO_MESSAGING_SERVICE_SID nor TWILIO_FROM is set"
+                error = "Neither TWILIO_MESSAGING_SERVICE_SID nor TWILIO_FROM is set"
+                return DeliveryReceipt(to_recipient_with_prefix, "twilio", "failed", error=error)
             create_kwargs["from_"] = from_number
     else:
         from_number = os.environ.get("TWILIO_FROM", "").strip()
         if not from_number:
-            return "TWILIO_FROM not set"
+            return DeliveryReceipt(to_recipient_with_prefix, "twilio", "failed", error="TWILIO_FROM not set")
         create_kwargs["from_"] = from_number
 
     try:
         msg = client.messages.create(**create_kwargs)
         print(f"[notify] Twilio message accepted for {to_recipient_with_prefix}. SID: {msg.sid}")
-        return None
+        return DeliveryReceipt(
+            to_recipient_with_prefix,
+            "twilio",
+            str(getattr(msg, "status", None) or "accepted"),
+            message_id=str(msg.sid),
+        )
     except Exception as exc:
-        return f"Twilio send failed for {to_recipient_with_prefix}: {exc}"
+        error = f"Twilio send failed for {to_recipient_with_prefix}: {exc}"
+        return DeliveryReceipt(to_recipient_with_prefix, "twilio", "failed", error=error)
 
 
-def _dispatch(recipient: str, body: str) -> Optional[str]:
-    """Send body to recipient via the appropriate channel. Returns None on success, error string on failure."""
+def _dispatch_with_receipt(recipient: str, body: str) -> DeliveryReceipt:
+    """Send body and retain the provider acknowledgement for delivery audit."""
     channel, normalized = _classify(recipient)
     if not normalized:
-        return f"empty recipient: {recipient!r}"
+        return DeliveryReceipt(recipient, channel, "failed", error=f"empty recipient: {recipient!r}")
 
     if channel == "signal":
         return _send_via_signal(normalized, body)
@@ -181,6 +202,19 @@ def _dispatch(recipient: str, body: str) -> Optional[str]:
     # Twilio expects "whatsapp:+..." or just "+..." — pass the original prefixed string
     twilio_recipient = recipient if channel == "whatsapp" else normalized
     return _send_via_twilio(twilio_recipient, body, channel)
+
+
+def _dispatch(recipient: str, body: str) -> Optional[str]:
+    """Compatibility wrapper used by operational alerts."""
+    return _dispatch_with_receipt(recipient, body).error
+
+
+def _receipt_error(receipt: DeliveryReceipt) -> Optional[str]:
+    if receipt.error:
+        return receipt.error
+    if receipt.status.strip().lower() in {"failed", "undelivered", "canceled", "cancelled"}:
+        return f"{receipt.provider} reported {receipt.status} for {receipt.recipient}"
+    return None
 
 
 # ── public entry points ────────────────────────────────────────────────────
@@ -215,37 +249,50 @@ def send_sms(slots: List[Slot]) -> SendResult:
     if not slots:
         return SendResult([], [])
 
-    try:
-        import supabase_pipe
-        if supabase_pipe.is_supabase_enabled():
-            supabase_pipe.pipe_slots_to_supabase(slots, booking_url)
-    except Exception as exc:
-        print(f'[notify] Supabase pipe failed: {exc}')
-
     by_recipient = defaultdict(list)
-    fallback_to = os.environ.get("TWILIO_TO", "")
+    unroutable: List[Slot] = []
     for slot in slots:
-        recipient = slot.recipient_phone or fallback_to
+        recipient = slot.recipient_phone
         if recipient:
-            by_recipient[recipient].append(slot)
+            by_recipient[(slot.owner_id, recipient)].append(slot)
+        else:
+            unroutable.append(slot)
 
     if not by_recipient:
         error = "No recipient phone configured"
         print(f"[notify] {error} — printing alert instead:")
         print(_format_message(slots))
-        return SendResult([], [error])
+        return SendResult([], [error], [])
 
     sent_slots: List[Slot] = []
-    errors: List[str] = []
-    for recipient, recipient_slots in by_recipient.items():
+    errors: List[str] = [
+        f"No recipient phone configured for watch {slot.watch_id or 'unknown'}"
+        for slot in unroutable
+    ]
+    for error in errors:
+        print(f"[notify] {error}")
+    receipts: List[DeliveryReceipt] = []
+    for (_, recipient), recipient_slots in by_recipient.items():
         body = _format_message(recipient_slots)
         if len(body) > MAX_MESSAGE_LENGTH:
             body = body[: MAX_MESSAGE_LENGTH - 3] + "..."
             print(f"[notify] Alert for {recipient} truncated to {MAX_MESSAGE_LENGTH} characters.")
-        err = _dispatch(recipient, body)
-        if err:
-            errors.append(err)
-            print(f"[notify] {err}")
+        receipt = _dispatch_with_receipt(recipient, body)
+        receipt_error = _receipt_error(receipt)
+        if receipt_error:
+            errors.append(receipt_error)
+            print(f"[notify] {receipt_error}")
         else:
             sent_slots.extend(recipient_slots)
-    return SendResult(sent_slots, errors)
+            receipts.append(receipt)
+            try:
+                import supabase_pipe
+                if supabase_pipe.is_supabase_enabled():
+                    record_result = supabase_pipe.record_delivery_receipts(recipient_slots, booking_url, receipt)
+                    for record_error in record_result.errors:
+                        errors.append(f"Delivery receipt persistence failed: {record_error}")
+            except Exception as exc:
+                error = f"Delivery receipt persistence failed: {exc}"
+                errors.append(error)
+                print(f"[notify] {error}")
+    return SendResult(sent_slots, errors, receipts)

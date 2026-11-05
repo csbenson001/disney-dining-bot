@@ -1,18 +1,29 @@
-"""
-Supabase integration pipe for disney-dining-bot.
-Pipes reservation availability directly into the disney-alerts platform.
+"""Owner-scoped Supabase bridge for ADR watches and delivery receipts.
+
+Supabase rows are authoritative identities. The bridge never invents an owner,
+substitutes an unrelated watch, or records an SMS before provider acceptance.
 """
 
 import os
-import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional
+
 import requests
 
 from monitor import Slot
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+
+@dataclass
+class ReceiptRecordResult:
+    inserted: int = 0
+    duplicates: int = 0
+    delivery_records: int = 0
+    errors: List[str] = field(default_factory=list)
 
 
 def is_supabase_enabled() -> bool:
@@ -28,117 +39,237 @@ def _headers() -> Dict[str, str]:
     }
 
 
-def get_default_user_id() -> Optional[str]:
-    """Finds the primary user in the disney-alerts database."""
-    if not is_supabase_enabled():
+def _get_rows(table: str, params: Dict[str, str]) -> List[Dict[str, Any]]:
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_headers(),
+        params=params,
+        timeout=8,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"{table} returned {response.status_code}: {response.text[:200]}")
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
+
+
+def _first(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return next(iter(rows), None)
+
+
+def _entity_for_reference(reference: str, fallback_name: str = "") -> Optional[Dict[str, Any]]:
+    reference = str(reference or "").strip()
+    if not reference:
         return None
+    select = "id,external_id,name,booking_url"
     try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/users?phone_e164=not.is.null&order=created_at.asc&limit=1",
-            headers=_headers(),
-            timeout=8,
-        )
-        if r.status_code == 200 and r.json():
-            return r.json()[0]["id"]
-    except Exception as e:
-        print(f"[supabase_pipe] error fetching user: {e}")
-    return None
-
-
-def get_or_create_watch_for_facility(facility_id: str, restaurant_name: str) -> Optional[str]:
-    """Resolves entity_id and ensures an active watch exists so foreign key is satisfied."""
-    if not is_supabase_enabled():
-        return None
-    try:
-        # 1. Lookup entity
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/entities?external_id=eq.{facility_id}&type=eq.RESTAURANT&limit=1",
-            headers=_headers(),
-            timeout=8,
-        )
-        entity = r.json()[0] if (r.status_code == 200 and r.json()) else None
-        if not entity:
-            # Fallback lookup by name
-            r2 = requests.get(
-                f"{SUPABASE_URL}/rest/v1/entities?name=ilike.*{restaurant_name}*&type=eq.RESTAURANT&limit=1",
-                headers=_headers(),
-                timeout=8,
-            )
-            entity = r2.json()[0] if (r2.status_code == 200 and r2.json()) else None
-
-        user_id = get_default_user_id()
-        if not user_id:
-            return None
-
-        # 2. Check existing watch for this entity
+        uuid.UUID(reference)
+        entity = _first(_get_rows("entities", {"id": f"eq.{reference}", "select": select, "limit": "1"}))
         if entity:
-            r_w = requests.get(
-                f"{SUPABASE_URL}/rest/v1/watches?entity_id=eq.{entity['id']}&user_id=eq.{user_id}&status=eq.active&limit=1",
-                headers=_headers(),
-                timeout=8,
-            )
-            if r_w.status_code == 200 and r_w.json():
-                return r_w.json()[0]["id"]
-
-            # Create an active watch for this restaurant
-            new_watch = {
-                "user_id": user_id,
-                "park_id": entity["park_id"],
-                "entity_id": entity["id"],
-                "type": "DINING_WALKUP",
-                "status": "active",
-                "cooldown_min": 60,
-            }
-            r_create = requests.post(
-                f"{SUPABASE_URL}/rest/v1/watches",
-                headers=_headers(),
-                json=new_watch,
-                timeout=8,
-            )
-            if r_create.status_code in (200, 201) and r_create.json():
-                return r_create.json()[0]["id"]
-
-        # 3. Fallback: return any active watch for user
-        r_any = requests.get(
-            f"{SUPABASE_URL}/rest/v1/watches?user_id=eq.{user_id}&limit=1",
-            headers=_headers(),
-            timeout=8,
-        )
-        if r_any.status_code == 200 and r_any.json():
-            return r_any.json()[0]["id"]
-
-    except Exception as e:
-        print(f"[supabase_pipe] error resolving watch for {facility_id}: {e}")
-    return None
+            return entity
+    except ValueError:
+        pass
+    entity = _first(_get_rows(
+        "entities",
+        {"external_id": f"eq.{reference}", "type": "eq.RESTAURANT", "select": select, "limit": "1"},
+    ))
+    if entity or not fallback_name:
+        return entity
+    return _first(_get_rows(
+        "entities",
+        {"name": f"ilike.*{fallback_name}*", "type": "eq.RESTAURANT", "select": select, "limit": "1"},
+    ))
 
 
-def pipe_slots_to_supabase(slots: List[Slot], booking_url_fn) -> int:
-    """Pipes newly found reservation slots directly into the disney-alerts alerts table."""
-    if not is_supabase_enabled() or not slots:
-        return 0
+def _recipient_for_user(user_id: str) -> str:
+    """Resolve only the phone attached to the exact verified owner profile."""
+    user = _first(_get_rows(
+        "users",
+        {"id": f"eq.{user_id}", "select": "id,phone_e164", "limit": "1"},
+    ))
+    return str((user or {}).get("phone_e164") or "").strip()
 
-    inserted = 0
-    now_iso = datetime.now(timezone.utc).isoformat()
 
-    for slot in slots:
-        condition_sig = f"DINING_ADR:{slot.facility_id}:{slot.date}:{slot.time}:{slot.party_size}"
+def _watch_dates(threshold: Dict[str, Any]) -> List[str]:
+    dates: List[str] = []
+    raw_dates = threshold.get("dates")
+    if isinstance(raw_dates, list):
+        dates.extend(str(value) for value in raw_dates if value)
+    for key in ("date", "dine_date", "target_date"):
+        value = threshold.get(key)
+        if value:
+            dates.append(str(value))
+    return list(dict.fromkeys(dates))
+
+
+def _watch_entities(watch: Dict[str, Any], threshold: Dict[str, Any]) -> List[Dict[str, str]]:
+    refs: List[Dict[str, str]] = []
+    if watch.get("entity_id"):
+        refs.append({"id": str(watch["entity_id"]), "name": str(threshold.get("entity_name") or "")})
+    elif threshold.get("entity_id") or threshold.get("venue_id"):
+        refs.append({
+            "id": str(threshold.get("entity_id") or threshold.get("venue_id")),
+            "name": str(threshold.get("entity_name") or ""),
+        })
+    bundled = threshold.get("bundled_entities")
+    if isinstance(bundled, list):
+        for item in bundled:
+            if isinstance(item, dict) and item.get("id"):
+                refs.append({"id": str(item["id"]), "name": str(item.get("name") or "")})
+    unique: Dict[str, Dict[str, str]] = {}
+    for ref in refs:
+        unique.setdefault(ref["id"], ref)
+    return list(unique.values())
+
+
+def _targets_for_watch(watch: Dict[str, Any], seen: set) -> List[Dict[str, Any]]:
+    watch_id = str(watch.get("id") or "").strip()
+    user_id = str(watch.get("user_id") or "").strip()
+    threshold = watch.get("threshold_json") if isinstance(watch.get("threshold_json"), dict) else {}
+    if not watch_id or not user_id or str(threshold.get("kind") or "").upper() != "ADR":
+        return []
+    dates = _watch_dates(threshold)
+    if not dates:
+        return []
+    recipient = _recipient_for_user(user_id)
+    if not recipient:
+        print(f"[supabase_pipe] skipping watch {watch_id}: no exact recipient")
+        return []
+    party_size = int(threshold.get("party_size") or 2)
+    raw_period = str(threshold.get("meal_period") or "ALL").upper()
+    meal_periods = [raw_period] if raw_period != "ALL" else ["BREAKFAST", "LUNCH", "DINNER"]
+    targets: List[Dict[str, Any]] = []
+    for ref in _watch_entities(watch, threshold):
+        entity = _entity_for_reference(ref["id"], ref["name"])
+        if not entity or not entity.get("external_id"):
+            print(f"[supabase_pipe] skipping watch {watch_id}: unresolved restaurant {ref['id']}")
+            continue
+        facility_id = str(entity["external_id"])
+        identity = (watch_id, facility_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        slug = str(entity.get("booking_url") or "").rstrip("/").split("/")[-1]
+        targets.append({
+            "watch_id": watch_id,
+            "owner_id": user_id,
+            "recipient_phone": recipient,
+            "name": entity.get("name") or ref["name"] or facility_id,
+            "facility_id": facility_id,
+            "slug": slug,
+            "party_size": party_size,
+            "dates": dates,
+            "meal_periods": meal_periods,
+        })
+    return targets
+
+
+def sync_plans_from_supabase() -> List[Dict[str, Any]]:
+    """Return one poll target per exact active ADR watch and restaurant.
+
+    Rows missing any delivery identity, date, or resolvable restaurant are
+    skipped. A dangling dining plan cannot be attributed to another watch.
+    """
+    if not is_supabase_enabled():
+        return []
+    try:
+        watches = _get_rows("watches", {
+            "status": "eq.active",
+            "select": "id,user_id,entity_id,type,threshold_json",
+        })
+        targets: List[Dict[str, Any]] = []
+        seen = set()
+        for watch in watches:
+            try:
+                targets.extend(_targets_for_watch(watch, seen))
+            except Exception as exc:
+                watch_id = str(watch.get("id") or "unknown")
+                print(f"[supabase_pipe] skipping malformed watch {watch_id}: {exc}")
+        return targets
+    except Exception as exc:
+        print(f"[supabase_pipe] error syncing watches from Supabase: {exc}")
+        return []
+
+
+def _condition_sig(slot: Slot) -> str:
+    return ":".join([
+        "DINING_ADR", slot.watch_id, slot.facility_id, slot.date, slot.time, str(slot.party_size),
+    ])
+
+
+def record_delivery_receipts(slots: List[Slot], booking_url_fn, receipt) -> ReceiptRecordResult:
+    """Record provider-accepted sends against their exact watch foreign key."""
+    result = ReceiptRecordResult()
+    if not is_supabase_enabled() or not slots or getattr(receipt, "error", None):
+        return result
+    fired_at_dt = datetime.now(timezone.utc)
+    fired_at = fired_at_dt.isoformat()
+    dedupe_cutoff = (fired_at_dt - timedelta(hours=2)).isoformat()
+    alert_ids = set()
+    provider = str(getattr(receipt, "provider", "") or "").lower()
+    message_id = str(getattr(receipt, "message_id", "") or "").strip()
+    if provider == "twilio" and message_id:
+        owner_ids = {slot.owner_id for slot in slots if slot.owner_id}
+        watch_ids = {slot.watch_id for slot in slots if slot.watch_id}
+        recipient = str(getattr(receipt, "recipient", "") or "")
+        destination_last4 = "".join(char for char in recipient if char.isdigit())[-4:] or None
+        delivery_row = {
+            "user_id": next(iter(owner_ids)) if len(owner_ids) == 1 else None,
+            "watch_id": next(iter(watch_ids)) if len(watch_ids) == 1 else None,
+            "alert_id": None,
+            "kind": "alert",
+            "provider": "twilio",
+            "provider_message_id": message_id,
+            "destination_last4": destination_last4,
+            "status": str(getattr(receipt, "status", "accepted") or "accepted").lower(),
+            "idempotency_key": f"twilio:{message_id}",
+            "accepted_at": fired_at,
+            "payload_json": {"source": "disney-dining-bot", "alert_count": len(slots)},
+        }
         try:
-            # Deduplication check: did we alert on this exact condition in the last 2 hours?
-            cutoff = datetime.fromtimestamp(time.time() - 7200, tz=timezone.utc).isoformat()
-            r_dup = requests.get(
-                f"{SUPABASE_URL}/rest/v1/alerts?condition_sig=eq.{condition_sig}&fired_at=gte.{cutoff}&limit=1",
-                headers=_headers(),
+            delivery_headers = _headers()
+            # Establish the SID before slower per-alert writes so callbacks can
+            # apply terminal status. Retries must never downgrade that status.
+            delivery_headers["Prefer"] = "resolution=ignore-duplicates,return=representation"
+            delivery_response = requests.post(
+                f"{SUPABASE_URL}/rest/v1/notification_deliveries",
+                headers=delivery_headers,
+                params={"on_conflict": "provider,provider_message_id"},
+                json=delivery_row,
                 timeout=8,
             )
-            if r_dup.status_code == 200 and r_dup.json():
-                # Already alerted recently
+            if delivery_response.status_code in (200, 201):
+                result.delivery_records = 1
+            else:
+                error = f"Twilio receipt insert returned {delivery_response.status_code}"
+                result.errors.append(error)
+                print(f"[supabase_pipe] {error}: {delivery_response.text}")
+        except Exception as exc:
+            error = f"Twilio receipt persistence failed: {exc}"
+            result.errors.append(error)
+            print(f"[supabase_pipe] {error}")
+    for slot in slots:
+        if not slot.watch_id or not slot.owner_id or not slot.recipient_phone:
+            print(f"[supabase_pipe] refusing unattributed receipt for {slot.restaurant_name}")
+            continue
+        condition_sig = _condition_sig(slot)
+        try:
+            duplicate_filter = {
+                "watch_id": f"eq.{slot.watch_id}",
+                "condition_sig": f"eq.{condition_sig}",
+                "select": "id",
+                "limit": "1",
+            }
+            message_id = str(getattr(receipt, "message_id", None) or "").strip()
+            if message_id:
+                duplicate_filter["payload_json->delivery->>messageSid"] = f"eq.{message_id}"
+            else:
+                duplicate_filter["fired_at"] = f"gte.{dedupe_cutoff}"
+            duplicate = _get_rows("alerts", duplicate_filter)
+            if duplicate:
+                result.duplicates += 1
+                if duplicate[0].get("id") is not None:
+                    alert_ids.add(duplicate[0]["id"])
                 continue
-
-            watch_id = get_or_create_watch_for_facility(slot.facility_id, slot.restaurant_name)
-            if not watch_id:
-                print(f"[supabase_pipe] unable to link watch for slot {slot.restaurant_name}")
-                continue
-
             book_url = booking_url_fn(slot)
             time_label = slot.label or slot.time
             payload = {
@@ -146,132 +277,63 @@ def pipe_slots_to_supabase(slots: List[Slot], booking_url_fn) -> int:
                 "entity": slot.restaurant_name,
                 "url": book_url,
                 "message": (
-                    f"🍽️ {slot.restaurant_name} table OPEN on {slot.date} at {time_label} "
-                    f"(Party {slot.party_size}, {slot.meal_period})! Book in My Disney Experience: {book_url}"
+                    f"{slot.restaurant_name} table open on {slot.date} at {time_label} "
+                    f"for {slot.party_size}. Book in My Disney Experience: {book_url}"
                 ),
                 "date": slot.date,
                 "time": slot.time,
                 "partySize": slot.party_size,
                 "mealPeriod": slot.meal_period,
+                "delivery": {
+                    "provider": getattr(receipt, "provider", "unknown"),
+                    "messageSid": getattr(receipt, "message_id", None),
+                    "providerStatus": getattr(receipt, "status", "accepted"),
+                },
             }
-
-            alert_row = {
-                "watch_id": watch_id,
-                "channel": "sms",
-                "condition_sig": condition_sig,
-                "payload_json": payload,
-                "fired_at": now_iso,
-            }
-
-            r_post = requests.post(
+            response = requests.post(
                 f"{SUPABASE_URL}/rest/v1/alerts",
                 headers=_headers(),
-                json=alert_row,
+                json={
+                    "watch_id": slot.watch_id,
+                    "channel": "sms",
+                    "condition_sig": condition_sig,
+                    "payload_json": payload,
+                    "fired_at": fired_at,
+                },
                 timeout=8,
             )
-            if r_post.status_code in (200, 201):
-                inserted += 1
-                print(f"[supabase_pipe] Successfully piped ADR alert to disney-alerts: {slot.restaurant_name} ({slot.date} {time_label})")
+            if response.status_code in (200, 201):
+                result.inserted += 1
+                try:
+                    inserted_rows = response.json()
+                    if isinstance(inserted_rows, list) and inserted_rows and inserted_rows[0].get("id") is not None:
+                        alert_ids.add(inserted_rows[0]["id"])
+                except Exception:
+                    pass
             else:
-                print(f"[supabase_pipe] failed to insert alert ({r_post.status_code}): {r_post.text}")
-        except Exception as e:
-            print(f"[supabase_pipe] failed to pipe slot {slot.restaurant_name}: {e}")
+                error = f"watch {slot.watch_id} receipt insert returned {response.status_code}"
+                result.errors.append(error)
+                print(f"[supabase_pipe] {error}: {response.text}")
+        except Exception as exc:
+            error = f"watch {slot.watch_id} receipt persistence failed: {exc}"
+            result.errors.append(error)
+            print(f"[supabase_pipe] {error}")
 
-    return inserted
-
-
-def sync_plans_from_supabase() -> List[Dict[str, Any]]:
-    """Fetches unbooked dining plans from disney-alerts to dynamically supplement target restaurants."""
-    if not is_supabase_enabled():
-        return []
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/dining_plans_view?booked=eq.false&select=*&order=dine_date.asc",
-            headers=_headers(),
-            timeout=8,
-        )
-        if r.status_code != 200 or not r.json():
-            return []
-
-        plans = r.json()
-        targets_by_facility: Dict[str, Dict[str, Any]] = {}
-
-        for plan in plans:
-            # Lookup entity facility_id
-            e_id = plan.get("entity_id")
-            if not e_id:
-                continue
-            r_ent = requests.get(
-                f"{SUPABASE_URL}/rest/v1/entities?id=eq.{e_id}&select=external_id,name,booking_url&limit=1",
-                headers=_headers(),
-                timeout=8,
-            )
-            if r_ent.status_code == 200 and r_ent.json():
-                ent = r_ent.json()[0]
-                fac_id = ent.get("external_id")
-                if not fac_id:
-                    continue
-                dine_date = plan.get("dine_date")
-                party_size = plan.get("party_size", 2)
-                slug = (ent.get("booking_url") or "").rstrip("/").split("/")[-1]
-
-                if fac_id not in targets_by_facility:
-                    targets_by_facility[fac_id] = {
-                        "name": ent["name"],
-                        "facility_id": fac_id,
-                        "slug": slug,
-                        "party_size": party_size,
-                        "dates": [],
-                        "meal_periods": ["BREAKFAST", "LUNCH", "DINNER"],
-                    }
-                if dine_date and dine_date not in targets_by_facility[fac_id]["dates"]:
-                    targets_by_facility[fac_id]["dates"].append(dine_date)
-
-        # Also check active watches with threshold_json->kind = ADR
+    if result.delivery_records and len(alert_ids) == 1:
         try:
-            r_w = requests.get(
-                f"{SUPABASE_URL}/rest/v1/watches?status=eq.active&select=entity_id,threshold_json",
+            link_response = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/notification_deliveries",
                 headers=_headers(),
+                params={"provider": "eq.twilio", "provider_message_id": f"eq.{message_id}"},
+                json={"alert_id": next(iter(alert_ids))},
                 timeout=8,
             )
-            if r_w.status_code == 200 and r_w.json():
-                for w in r_w.json():
-                    tj = w.get("threshold_json") or {}
-                    if (tj.get("kind") == "ADR" or tj.get("date")) and tj.get("date"):
-                        e_id = w.get("entity_id")
-                        if not e_id:
-                            continue
-                        r_ent = requests.get(
-                            f"{SUPABASE_URL}/rest/v1/entities?id=eq.{e_id}&select=external_id,name,booking_url&limit=1",
-                            headers=_headers(),
-                            timeout=8,
-                        )
-                        if r_ent.status_code == 200 and r_ent.json():
-                            ent = r_ent.json()[0]
-                            fac_id = ent.get("external_id")
-                            if not fac_id:
-                                continue
-                            dine_date = tj.get("date")
-                            party_size = tj.get("party_size", 2)
-                            slug = (ent.get("booking_url") or "").rstrip("/").split("/")[-1]
-                            mp = tj.get("meal_period")
-                            periods = [mp] if mp and mp != "ALL" else ["BREAKFAST", "LUNCH", "DINNER"]
-
-                            if fac_id not in targets_by_facility:
-                                targets_by_facility[fac_id] = {
-                                    "name": ent["name"],
-                                    "facility_id": fac_id,
-                                    "slug": slug,
-                                    "party_size": party_size,
-                                    "dates": [],
-                                    "meal_periods": periods,
-                                }
-                            if dine_date and dine_date not in targets_by_facility[fac_id]["dates"]:
-                                targets_by_facility[fac_id]["dates"].append(dine_date)
-        except Exception as e_w:
-            print(f"[supabase_pipe] error syncing watches from Supabase: {e_w}")
-
-        return list(targets_by_facility.values())
-    except Exception as e:
-        print(f"[supabase_pipe] error syncing plans from Supabase: {e}")
-        return []
+            if link_response.status_code not in (200, 204):
+                error = f"Twilio receipt alert link returned {link_response.status_code}"
+                result.errors.append(error)
+                print(f"[supabase_pipe] {error}: {link_response.text}")
+        except Exception as exc:
+            error = f"Twilio receipt alert link failed: {exc}"
+            result.errors.append(error)
+            print(f"[supabase_pipe] {error}")
+    return result
