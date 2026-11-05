@@ -2,7 +2,7 @@
 Disney Lightning Lane Autonomous Booking Daemon (autobook_service.py)
 Part of disney-dining-bot & disney-alerts integration.
 
-Maintains the WDW Ride Coach session (wdwridecoach@gmail.com), resolves connected
+Maintains the dedicated WDW Ride Coach session, resolves connected
 family/friends party members, and executes Lightning Lane hold & booking API requests
 directly on Disney's Virtual Access Service (VAS) backend.
 """
@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("autobook")
 
-AUTOBOOK_API_KEY = os.environ.get("AUTOBOOK_API_KEY", os.environ.get("API_SECRET", "disney_autobook_benson_2026_secret")).strip()
+AUTOBOOK_API_KEY = os.environ.get("AUTOBOOK_API_KEY", os.environ.get("API_SECRET", "")).strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
@@ -98,7 +98,7 @@ def verify_api_key(
     authorization: Optional[str] = Header(default=None),
 ):
     if not AUTOBOOK_API_KEY:
-        return  # Open access in local test mode if not configured
+        raise HTTPException(status_code=503, detail="Autobook API authentication is not configured")
     if request.method == "OPTIONS":
         return
 
@@ -115,8 +115,11 @@ def verify_api_key(
 # ── Party Roster Management ────────────────────────────────────────────────
 
 def get_party_roster() -> List[Dict[str, Any]]:
-    """Loads connected travelling party members from friends_api_data.json or fallback cache."""
-    friends_path = Path(__file__).parent / "friends_api_data.json"
+    """Loads connected travelling party members from a protected runtime capture."""
+    configured_path = os.environ.get("DISNEY_FRIENDS_DATA_PATH", "").strip()
+    if not configured_path:
+        raise RuntimeError("Protected Disney party roster is unavailable or incomplete")
+    friends_path = Path(configured_path).expanduser()
     roster = []
 
     if friends_path.exists():
@@ -138,12 +141,6 @@ def get_party_roster() -> List[Dict[str, Any]]:
                             xid = g_ids.get("xid")
                             status = friend.get("status")
 
-                            # Swap Neil Blandford -> Arielle Banford for the 5th guest slot
-                            if guid == "92a080e7-6622-218c-4c4c-e97845462387" or "neil" in full_name.lower():
-                                full_name = "Arielle Banford"
-                                first = "Arielle"
-                                last = "Banford"
-
                             roster.append({
                                 "name": full_name,
                                 "first_name": first,
@@ -155,62 +152,10 @@ def get_party_roster() -> List[Dict[str, Any]]:
                                 "connected": status == "ALREADY_CONNECTED",
                             })
         except Exception as e:
-            logger.warning(f"Error parsing friends_api_data.json: {e}")
+            logger.warning("Error parsing protected Disney party roster: %s", type(e).__name__)
 
-    # Fallback to verified Benson party definitions if file read produced incomplete list
-    if not roster or len(roster) < 5:
-        roster = [
-            {
-                "name": "chris benson",
-                "first_name": "chris",
-                "last_name": "benson",
-                "id": "{A5DD1DA6-0AF1-4442-BCDF-6E567AB36C9F}",
-                "guid": "{A5DD1DA6-0AF1-4442-BCDF-6E567AB36C9F}",
-                "xid": "60B7B9B4-C079-3FCF-3496-5DCA3846C42F",
-                "status": "ALREADY_CONNECTED",
-                "connected": True,
-            },
-            {
-                "name": "Mrs. meredith benson",
-                "first_name": "meredith",
-                "last_name": "benson",
-                "id": "3b7f40bd-ec76-4aba-be1f-6907f3ab1d2d",
-                "guid": "3b7f40bd-ec76-4aba-be1f-6907f3ab1d2d",
-                "xid": "3065EFF1-9E34-A007-99FD-2F2F541D2F23",
-                "status": "ALREADY_CONNECTED",
-                "connected": True,
-            },
-            {
-                "name": "Mr. ryan benson",
-                "first_name": "ryan",
-                "last_name": "benson",
-                "id": "05635a6c-42d4-9a9d-3bba-34ac2e01add1",
-                "guid": "05635a6c-42d4-9a9d-3bba-34ac2e01add1",
-                "xid": "B4CA0BD5-1D44-8FA0-68FD-726E39BE0F97",
-                "status": "ALREADY_CONNECTED",
-                "connected": True,
-            },
-            {
-                "name": "Mr. stephen benson",
-                "first_name": "stephen",
-                "last_name": "benson",
-                "id": "6c2dcfed-fcef-40d7-8468-52295b61bcdd",
-                "guid": "6c2dcfed-fcef-40d7-8468-52295b61bcdd",
-                "xid": "6AAB3D66-1BE0-4377-61DD-27FA284CAFD7",
-                "status": "ALREADY_CONNECTED",
-                "connected": True,
-            },
-            {
-                "name": "Arielle Banford",
-                "first_name": "Arielle",
-                "last_name": "Banford",
-                "id": "92a080e7-6622-218c-4c4c-e97845462387",
-                "guid": "92a080e7-6622-218c-4c4c-e97845462387",
-                "xid": "0DDD26DF-543C-BD2B-D5C5-4604F8A2F3B8",
-                "status": "ALREADY_CONNECTED",
-                "connected": True,
-            },
-        ]
+    if len(roster) < 5:
+        raise RuntimeError("Protected Disney party roster is unavailable or incomplete")
     return roster
 
 
@@ -235,7 +180,6 @@ def resolve_requested_guests(requested_names: Optional[List[str]]) -> List[Dict[
                 or req_clean in g_name
                 or (g_first in req_clean and g_last in req_clean)
                 or req_clean == g_first
-                or (g_first == "arielle" and ("neil" in req_clean or "blandford" in req_clean or "banford" in req_clean or "arielle" in req_clean))
             ):
                 if g not in matched:
                     matched.append(g)
@@ -447,32 +391,10 @@ class BookingRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    """Returns daemon health, coach token freshness, and linked party status."""
-    token_valid = False
-    exp_remaining = 0
-    token_err = None
-
-    try:
-        token = auth.get_valid_token()
-        exp = auth._jwt_exp(token)
-        exp_remaining = int(exp - time.time())
-        token_valid = exp_remaining > 60
-    except Exception as e:
-        token_err = str(e)
-
-    party = get_party_roster()
-    tokens_meta = storage.read_json("tokens.json") or {}
-
+    """Return a public liveness response without account or session details."""
     return {
-        "status": "healthy" if token_valid else "degraded",
+        "status": "ok",
         "service": "Disney Autonomous Booking Daemon",
-        "coach_account": tokens_meta.get("account_email", "wdwridecoach@gmail.com"),
-        "coach_swid": tokens_meta.get("swid", "{6C27C4FE-D20C-4DEE-B27B-026DB6C9458E}"),
-        "token_valid": token_valid,
-        "token_expires_in_seconds": exp_remaining,
-        "token_error": token_err,
-        "party_count": len(party),
-        "party_members": [p["name"] for p in party],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -568,7 +490,9 @@ def book_lightning_lane(req: BookingRequest):
         raise HTTPException(status_code=502, detail=err_msg)
 
     tokens_meta = storage.read_json("tokens.json") or {}
-    coach_swid = tokens_meta.get("swid", "{6C27C4FE-D20C-4DEE-B27B-026DB6C9458E}")
+    coach_swid = str(tokens_meta.get("swid") or "").strip()
+    if not coach_swid:
+        raise HTTPException(status_code=503, detail="Disney coach identity is not configured")
     disney_facility_id = resolve_disney_facility_id(req.facility_id, ride_name)
 
     # Dry-Run / Simulation mode: Actively verifies live Disney auth and tipboard status
@@ -725,17 +649,28 @@ def book_lightning_lane(req: BookingRequest):
 def reseed_session():
     """Trigger seed_coach_login.py to refresh or establish fresh Disney session tokens."""
     import subprocess
+    email = os.environ.get("DISNEY_LOGIN_EMAIL", "").strip()
+    password = os.environ.get("DISNEY_LOGIN_PASSWORD", "").strip()
+    if not email or not password:
+        raise HTTPException(status_code=503, detail="Disney login credentials are not configured")
     cmd = [
         "python3",
         str(Path(__file__).parent / "seed_coach_login.py"),
-        "--email", os.environ.get("DISNEY_LOGIN_EMAIL", "wdwridecoach@gmail.com"),
-        "--password", os.environ.get("DISNEY_LOGIN_PASSWORD", "Christo123!"),
     ]
     if os.environ.get("DISNEY_HEADLESS", "false").lower() == "true":
         cmd.append("--headless")
 
     logger.info("Triggering Disney session re-seeder...")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    child_env = os.environ.copy()
+    child_env["DISNEY_LOGIN_EMAIL"] = email
+    child_env["DISNEY_LOGIN_PASSWORD"] = password
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=child_env,
+    )
     return {
         "ok": True,
         "message": "Disney session seeder launched in background",

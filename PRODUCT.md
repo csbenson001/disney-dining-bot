@@ -174,6 +174,7 @@ DISNEY_BROWSER_PROFILE_DIR — persistent Playwright profile path
 DISNEY_HEADLESS — MUST be "false" on the VPS. Akamai detects truly-headless Chromium on disneyworld.disney.go.com and aborts with ERR_HTTP2_PROTOCOL_ERROR. Run headed under xvfb-run instead.
 DISNEY_LOGIN_EMAIL — dedicated Disney bot account email (VPS only)
 DISNEY_LOGIN_PASSWORD — dedicated Disney bot account password (VPS only)
+DISNEY_FRIENDS_DATA_PATH — absolute path to the root-only Friends & Family runtime capture outside the Git checkout
 DISNEY_RECOVERY_LOG_PATH — optional override for the full Login Agent log (default /var/log/disney-dining-bot/last-recovery.log)
 DISNEY_ALERT_ADMIN — optional WATCH_USERS user_id to receive operational alerts; defaults to default_owner_id (craig)
 PLANNER_WATCH_CAP — optional Planner per-account billable-watch cap (default 4). Netlify only.
@@ -238,7 +239,7 @@ git push origin cursor/self-hosted-mousewatcher
 git push origin HEAD:main
 
 # VPS worker sync after worker-code changes:
-ssh -i "$HOME/.ssh/disney_dining_vps" root@107.170.35.91 \
+ssh -i "$HOME/.ssh/disney_dining_vps" root@${DISNEY_VPS_HOST} \
   'cd /opt/disney-dining-bot && git pull --ff-only origin cursor/self-hosted-mousewatcher && systemctl is-active disney-dining-bot.timer'
 ```
 

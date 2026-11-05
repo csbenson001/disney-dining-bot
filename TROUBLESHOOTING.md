@@ -2,15 +2,15 @@
 
 A runbook for diagnosing the bot from the VPS without reading any source. Read top to bottom; each section is self-contained.
 
-VPS: `root@107.170.35.91`, SSH key `~/.ssh/disney_dining_vps`, app at `/opt/disney-dining-bot`.
+VPS: `root@${DISNEY_VPS_HOST}`, SSH key `~/.ssh/disney_dining_vps`, app at `/opt/disney-dining-bot`.
 
 ## At-a-glance: alert channels
 
 | Alert source | Trigger | Goes to | Channel |
 |---|---|---|---|
-| Bot's Signal alert (in-process) | Disney session lost; Login Agent failed | Craig only | Signal (`+19852359090` "Magic Table Finder" → Craig) |
+| Bot's Signal alert (in-process) | Disney session lost; Login Agent failed | Craig only | Signal (`${SIGNAL_BOT_NUMBER}` "Magic Table Finder" → Craig) |
 | Reservation match | New opening on a watch | Watch's owner only | Signal |
-| UptimeRobot | `/_api/health` returns non-200 for >5 min, or no response for >30 min | `craig@sco.gs` | Email |
+| UptimeRobot | `/_api/health` returns non-200 for >5 min, or no response for >30 min | `${ALERT_CONTACT_EMAIL}` | Email |
 
 If you haven't gotten an alert and feel anxious: hit https://magictablefinder.com/_api/health from any browser. `"ok":true` means the bot is healthy — Disney just doesn't have anything matching your watches yet.
 
@@ -19,7 +19,7 @@ If you haven't gotten an alert and feel anxious: hit https://magictablefinder.co
 ## 1. Quick health check
 
 ```bash
-ssh -i ~/.ssh/disney_dining_vps root@107.170.35.91
+ssh -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST}
 cd /opt/disney-dining-bot
 systemctl is-active disney-dining-bot.timer    # should be "active"
 journalctl -u disney-dining-bot.service -n 50 --no-pager
@@ -115,7 +115,7 @@ In practice, manually re-seeding (§3) is faster and resets the same condition.
 This is the universal fix when the bot says "Disney auth required" or "Re-seed the VPS browser profile".
 
 ```bash
-ssh -t -i ~/.ssh/disney_dining_vps root@107.170.35.91 \
+ssh -t -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST} \
   'cd /opt/disney-dining-bot && . .venv/bin/activate && \
    DISNEY_HEADLESS=false xvfb-run -a python3 seed_disney_session.py'
 ```
@@ -136,7 +136,7 @@ The `-t` allocates a TTY so you can press Enter when login completes. The script
   ```
 * **Forward X over SSH so you can see the browser:**
   ```bash
-  ssh -X -t -i ~/.ssh/disney_dining_vps root@107.170.35.91 \
+  ssh -X -t -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST} \
     'cd /opt/disney-dining-bot && . .venv/bin/activate && \
      DISNEY_HEADLESS=false python3 seed_disney_session.py'
   # Note: no xvfb-run, and you need XQuartz on macOS.
@@ -145,7 +145,7 @@ The `-t` allocates a TTY so you can press Enter when login completes. The script
 **Verify success:**
 
 ```bash
-ssh -i ~/.ssh/disney_dining_vps root@107.170.35.91 \
+ssh -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST} \
   'systemctl start disney-dining-bot.service; sleep 60; \
    journalctl -u disney-dining-bot.service -n 30 --no-pager --since "2 minutes ago"'
 ```
@@ -159,7 +159,7 @@ You want to see `=== poll done ===` with no `Check failed` lines.
 If running `seed_disney_session.py` from an SSH session crashes within seconds with a Node.js `EPIPE` traceback (no `[seed]` log lines), Chrome cannot acquire the profile because of a leftover lock from a previously-killed Chromium.
 
 ```bash
-ssh -i ~/.ssh/disney_dining_vps root@107.170.35.91 \
+ssh -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST} \
   'rm -f /opt/disney-dining-bot/.browser-profile/SingletonLock \
          /opt/disney-dining-bot/.browser-profile/SingletonCookie \
          /opt/disney-dining-bot/.browser-profile/SingletonSocket'
@@ -168,7 +168,7 @@ ssh -i ~/.ssh/disney_dining_vps root@107.170.35.91 \
 Also make sure no rogue Chromium is still running:
 
 ```bash
-ssh -i ~/.ssh/disney_dining_vps root@107.170.35.91 'pgrep -af chromium; pgrep -af xvfb-run'
+ssh -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST} 'pgrep -af chromium; pgrep -af xvfb-run'
 # kill any leftover processes if found
 ```
 
@@ -185,7 +185,7 @@ The body looks like:
 ```
 Disney Dining Bot: Disney login session failed after automatic recovery.
 Manual re-seed required. On a machine with your SSH key:
-ssh -i ~/.ssh/disney_dining_vps -t root@107.170.35.91 'cd /opt/disney-dining-bot && . .venv/bin/activate && DISNEY_HEADLESS=false xvfb-run -a python3 seed_disney_session.py'
+ssh -i ~/.ssh/disney_dining_vps -t root@${DISNEY_VPS_HOST} 'cd /opt/disney-dining-bot && . .venv/bin/activate && DISNEY_HEADLESS=false xvfb-run -a python3 seed_disney_session.py'
 ```
 
 ### How alerts are routed
@@ -197,14 +197,14 @@ ssh -i ~/.ssh/disney_dining_vps -t root@107.170.35.91 'cd /opt/disney-dining-bot
 - `whatsapp:+15551234567` → Twilio WhatsApp (legacy / fallback only)
 - `+15551234567` → Twilio SMS (legacy / fallback only)
 
-The bot's Signal sender account is `+19852359090` (a Google Voice number, registered with Signal under display name "Magic Table Finder"). Set in `.env` as `SIGNAL_BOT_NUMBER`. Operational alerts route to whatever `_configured_owner_phones()` returns, which is *only the admin's phone* — admin is `default_owner_id()` (i.e. `craig`) unless overridden via `DISNEY_ALERT_ADMIN`.
+The bot's Signal sender account is configured privately in `.env` as `SIGNAL_BOT_NUMBER`. Operational alerts route to whatever `_configured_owner_phones()` returns, which is *only the admin's phone* — admin is `default_owner_id()` (i.e. `craig`) unless overridden via `DISNEY_ALERT_ADMIN`.
 
 ### If you didn't get a Signal alert but the bot is clearly broken
 
-* Check `journalctl` for `[notify] signal-cli exit ...` or `[notify] signal-cli timed out` — signal-cli on the VPS hit an issue. Check `signal-cli -a +19852359090 listAccounts` works.
+* Check `journalctl` for `[notify] signal-cli exit ...` or `[notify] signal-cli timed out` — signal-cli on the VPS hit an issue. Check `signal-cli -a ${SIGNAL_BOT_NUMBER} listAccounts` works.
 * Check `journalctl` for `[bot] Recovery failed but no owner phones are configured for alerting.` — `WATCH_USERS` in `.env` is missing the admin's phone.
 * Check `bot_state.json:last_session_manual_alert_at` — if it's within the last 6 hours, you're inside the rate-limit window. The bot still needs a re-seed; you just won't get another Signal alert yet. Clear that field in the Gist if you need a fresh test alert.
-* If signal-cli fails with `Unregistered user`: the recipient's Signal account hides their phone number. Have them message the bot's Signal number first, then run `signal-cli -a +19852359090 receive` once on the VPS to learn their UUID, then store `signal:<uuid>` in `WATCH_USERS` instead of `signal:+phone`.
+* If signal-cli fails with `Unregistered user`: the recipient's Signal account hides their phone number. Have them message the bot's Signal number first, then run `signal-cli -a ${SIGNAL_BOT_NUMBER} receive` once on the VPS to learn their UUID, then store `signal:<uuid>` in `WATCH_USERS` instead of `signal:+phone`.
 
 ## 5a. UptimeRobot — the external watchdog
 
@@ -213,7 +213,7 @@ The in-bot Signal alert can only fire when the bot is alive enough to detect a f
 - **Monitor:** HTTP GET `https://magictablefinder.com/_api/health` every 5 minutes.
 - **Healthy:** returns `200 {"ok":true,"last_successful_poll_at":"...","age_minutes":N}` when the bot has polled within the last 30 minutes.
 - **Unhealthy:** returns `503 {"ok":false,"reason":"..."}` when stale or no poll on record.
-- **Alert contact:** email to `craig@sco.gs`. Make sure the email app on Craig's phone has push notifications enabled.
+- **Alert contact:** email to `${ALERT_CONTACT_EMAIL}`. Make sure the email app on Craig's phone has push notifications enabled.
 
 If you want to tune the staleness threshold, set `HEALTH_STALE_MINUTES` in Netlify env vars (default 30).
 
@@ -274,8 +274,8 @@ journalctl -u disney-dining-bot.service -n 200 --no-pager | \
 cat /var/log/disney-dining-bot/last-recovery.log
 
 # Signal: confirm the bot's account is registered and reachable
-signal-cli -a +19852359090 listAccounts
-signal-cli -a +19852359090 send -m "manual test" <recipient>
+signal-cli -a ${SIGNAL_BOT_NUMBER} listAccounts
+signal-cli -a ${SIGNAL_BOT_NUMBER} send -m "manual test" <recipient>
 
 # Manually re-seed Disney session (the canonical fix for "auth required" errors)
 cd /opt/disney-dining-bot && . .venv/bin/activate && \

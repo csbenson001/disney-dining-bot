@@ -158,14 +158,8 @@ def _do_refresh(tokens: dict) -> dict:
             timeout=15,
         )
     if resp.status_code != 200:
-        body_preview = (resp.text or "")[:600]
-        print(
-            f"[auth] refresh non-200: HTTP {resp.status_code} from {REFRESH_URL}; "
-            f"body: {body_preview!r}"
-        )
-        raise RuntimeError(
-            f"Token refresh failed: HTTP {resp.status_code}\n{body_preview}"
-        )
+        print(f"[auth] refresh non-200: HTTP {resp.status_code} from Disney token endpoint")
+        raise RuntimeError(f"Token refresh failed: HTTP {resp.status_code}")
     body = resp.json()
 
     # Disney jgc/v8 returns {"data": {"token": {"access_token": ..., "refresh_token": ...}}}
@@ -191,7 +185,7 @@ def _do_refresh(tokens: dict) -> dict:
         "access_token": new_access,
         "refresh_token": new_refresh,
         "swid": swid,
-        "account_email": tokens.get("account_email", "wdwridecoach@gmail.com"),
+        "account_email": tokens.get("account_email", ""),
         "updated_at": time.time(),
     }
 

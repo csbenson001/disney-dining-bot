@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
 
-DEFAULT_EMAIL = "taco79bear@gmail.com"
-DEFAULT_HOST = "root@107.170.35.91"
-DEFAULT_KEY = "~/.ssh/disney_dining_vps"
+DEFAULT_EMAIL = ""
+DEFAULT_HOST = os.environ.get("DISNEY_VPS_HOST", "")
+DEFAULT_KEY = os.environ.get("DISNEY_VPS_SSH_KEY", "~/.ssh/disney_dining_vps")
 REMOTE_ENV_PATH = "/opt/disney-dining-bot/.env"
 
 
@@ -34,18 +35,16 @@ def ssh_base(expanded_path: str, host: str) -> list[str]:
 
 
 def merge_remote_env(host: str, key_path: str, email: str, password: str) -> None:
-    import base64
-    import os
     import shlex
 
     key_expanded = os.path.expanduser(key_path)
-    pld = json.dumps({"email": email, "password": password})
-    inner = (
+    remote_program = (
         "import json\n"
+        "import sys\n"
         "from pathlib import Path\n"
-        f"data = json.loads({repr(pld)})\n"
-        "email = data['email'].strip()\n"
-        "password = data['password']\n"
+        "data = json.load(sys.stdin)\n"
+        "email = str(data['email']).strip()\n"
+        "password = str(data['password'])\n"
         f"path = Path({repr(REMOTE_ENV_PATH)})\n"
         "lines_out = []\n"
         "if path.exists():\n"
@@ -58,15 +57,10 @@ def merge_remote_env(host: str, key_path: str, email: str, password: str) -> Non
         "path.write_text(chr(10).join(lines_out) + chr(10))\n"
         "print('DISNEY_LOGIN_* lines merged into', path)\n"
     )
-    blob = base64.b64encode(inner.encode()).decode("ascii")
-    remote_cmd = (
-        "set -e; "
-        f"echo {shlex.quote(blob)} | base64 -d > /tmp/m_disney_merge_env.py; "
-        "python3 /tmp/m_disney_merge_env.py; "
-        "rm -f /tmp/m_disney_merge_env.py"
-    )
+    remote_cmd = "python3 -c " + shlex.quote(remote_program)
     cmd = ssh_base(key_expanded, host) + [remote_cmd]
-    r = subprocess.run(cmd, capture_output=True)
+    payload = json.dumps({"email": email, "password": password}).encode()
+    r = subprocess.run(cmd, input=payload, capture_output=True)
     if r.returncode != 0:
         sys.stderr.buffer.write(r.stderr)
         raise SystemExit(r.returncode or 1)
@@ -101,6 +95,9 @@ def main() -> None:
         help="After merge, run xvfb seed_disney_session.py then disney_bot.py --once",
     )
     args = parser.parse_args()
+
+    if not args.email or not args.host:
+        parser.error("--email and --host (or DISNEY_VPS_HOST) are required")
 
     if args.password_stdin:
         password = sys.stdin.read().rstrip("\r\n")
