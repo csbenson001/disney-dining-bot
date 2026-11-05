@@ -157,6 +157,9 @@ def _send_via_twilio(to_recipient_with_prefix: str, body: str, channel: str) -> 
         return DeliveryReceipt(to_recipient_with_prefix, "twilio", "failed", error="Twilio credentials not set")
 
     create_kwargs = {"body": body, "to": to_recipient_with_prefix}
+    status_callback_url = os.environ.get("TWILIO_STATUS_CALLBACK_URL", "").strip()
+    if status_callback_url:
+        create_kwargs["status_callback"] = status_callback_url
     if channel == "sms":
         messaging_service_sid = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "").strip()
         if messaging_service_sid:
@@ -251,7 +254,7 @@ def send_sms(slots: List[Slot]) -> SendResult:
     for slot in slots:
         recipient = slot.recipient_phone
         if recipient:
-            by_recipient[recipient].append(slot)
+            by_recipient[(slot.owner_id, recipient)].append(slot)
         else:
             unroutable.append(slot)
 
@@ -269,7 +272,7 @@ def send_sms(slots: List[Slot]) -> SendResult:
     for error in errors:
         print(f"[notify] {error}")
     receipts: List[DeliveryReceipt] = []
-    for recipient, recipient_slots in by_recipient.items():
+    for (_, recipient), recipient_slots in by_recipient.items():
         body = _format_message(recipient_slots)
         if len(body) > MAX_MESSAGE_LENGTH:
             body = body[: MAX_MESSAGE_LENGTH - 3] + "..."

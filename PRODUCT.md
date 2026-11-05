@@ -167,6 +167,7 @@ GITHUB_GIST_ID — 7e8d8f873715971f8989a25a2f22c089
 TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN — Twilio API credentials
 TWILIO_MESSAGING_SERVICE_SID — A2P 10DLC-registered Messaging Service (primary path for `+1...` SMS recipients). Twilio picks the registered sender from the pool; do not also set TWILIO_FROM for SMS.
 TWILIO_FROM — fallback sender. For WhatsApp recipients set to `whatsapp:+1...` (sandbox). For SMS, only used when TWILIO_MESSAGING_SERVICE_SID is unset (dev only — unregistered traffic is rejected by US carriers).
+TWILIO_STATUS_CALLBACK_URL — public DisScan webhook URL used by Twilio to reconcile queued messages to terminal delivered or failed status. Omit safely in local development.
 SIGNAL_BOT_NUMBER — phone number the bot's signal-cli account sends FROM (alternative channel; recipients prefixed `signal:`)
 SIGNAL_CLI_PATH — optional override for signal-cli binary (default /usr/local/bin/signal-cli)
 DISNEY_BROWSER_PROFILE_DIR — persistent Playwright profile path

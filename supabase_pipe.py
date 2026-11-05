@@ -22,6 +22,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 class ReceiptRecordResult:
     inserted: int = 0
     duplicates: int = 0
+    delivery_records: int = 0
     errors: List[str] = field(default_factory=list)
 
 
@@ -203,6 +204,49 @@ def record_delivery_receipts(slots: List[Slot], booking_url_fn, receipt) -> Rece
     fired_at_dt = datetime.now(timezone.utc)
     fired_at = fired_at_dt.isoformat()
     dedupe_cutoff = (fired_at_dt - timedelta(hours=2)).isoformat()
+    alert_ids = set()
+    provider = str(getattr(receipt, "provider", "") or "").lower()
+    message_id = str(getattr(receipt, "message_id", "") or "").strip()
+    if provider == "twilio" and message_id:
+        owner_ids = {slot.owner_id for slot in slots if slot.owner_id}
+        watch_ids = {slot.watch_id for slot in slots if slot.watch_id}
+        recipient = str(getattr(receipt, "recipient", "") or "")
+        destination_last4 = "".join(char for char in recipient if char.isdigit())[-4:] or None
+        delivery_row = {
+            "user_id": next(iter(owner_ids)) if len(owner_ids) == 1 else None,
+            "watch_id": next(iter(watch_ids)) if len(watch_ids) == 1 else None,
+            "alert_id": None,
+            "kind": "alert",
+            "provider": "twilio",
+            "provider_message_id": message_id,
+            "destination_last4": destination_last4,
+            "status": str(getattr(receipt, "status", "accepted") or "accepted").lower(),
+            "idempotency_key": f"twilio:{message_id}",
+            "accepted_at": fired_at,
+            "payload_json": {"source": "disney-dining-bot", "alert_count": len(slots)},
+        }
+        try:
+            delivery_headers = _headers()
+            # Establish the SID before slower per-alert writes so callbacks can
+            # apply terminal status. Retries must never downgrade that status.
+            delivery_headers["Prefer"] = "resolution=ignore-duplicates,return=representation"
+            delivery_response = requests.post(
+                f"{SUPABASE_URL}/rest/v1/notification_deliveries",
+                headers=delivery_headers,
+                params={"on_conflict": "provider,provider_message_id"},
+                json=delivery_row,
+                timeout=8,
+            )
+            if delivery_response.status_code in (200, 201):
+                result.delivery_records = 1
+            else:
+                error = f"Twilio receipt insert returned {delivery_response.status_code}"
+                result.errors.append(error)
+                print(f"[supabase_pipe] {error}: {delivery_response.text}")
+        except Exception as exc:
+            error = f"Twilio receipt persistence failed: {exc}"
+            result.errors.append(error)
+            print(f"[supabase_pipe] {error}")
     for slot in slots:
         if not slot.watch_id or not slot.owner_id or not slot.recipient_phone:
             print(f"[supabase_pipe] refusing unattributed receipt for {slot.restaurant_name}")
@@ -223,6 +267,8 @@ def record_delivery_receipts(slots: List[Slot], booking_url_fn, receipt) -> Rece
             duplicate = _get_rows("alerts", duplicate_filter)
             if duplicate:
                 result.duplicates += 1
+                if duplicate[0].get("id") is not None:
+                    alert_ids.add(duplicate[0]["id"])
                 continue
             book_url = booking_url_fn(slot)
             time_label = slot.label or slot.time
@@ -258,12 +304,36 @@ def record_delivery_receipts(slots: List[Slot], booking_url_fn, receipt) -> Rece
             )
             if response.status_code in (200, 201):
                 result.inserted += 1
+                try:
+                    inserted_rows = response.json()
+                    if isinstance(inserted_rows, list) and inserted_rows and inserted_rows[0].get("id") is not None:
+                        alert_ids.add(inserted_rows[0]["id"])
+                except Exception:
+                    pass
             else:
                 error = f"watch {slot.watch_id} receipt insert returned {response.status_code}"
                 result.errors.append(error)
                 print(f"[supabase_pipe] {error}: {response.text}")
         except Exception as exc:
             error = f"watch {slot.watch_id} receipt persistence failed: {exc}"
+            result.errors.append(error)
+            print(f"[supabase_pipe] {error}")
+
+    if result.delivery_records and len(alert_ids) == 1:
+        try:
+            link_response = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/notification_deliveries",
+                headers=_headers(),
+                params={"provider": "eq.twilio", "provider_message_id": f"eq.{message_id}"},
+                json={"alert_id": next(iter(alert_ids))},
+                timeout=8,
+            )
+            if link_response.status_code not in (200, 204):
+                error = f"Twilio receipt alert link returned {link_response.status_code}"
+                result.errors.append(error)
+                print(f"[supabase_pipe] {error}: {link_response.text}")
+        except Exception as exc:
+            error = f"Twilio receipt alert link failed: {exc}"
             result.errors.append(error)
             print(f"[supabase_pipe] {error}")
     return result

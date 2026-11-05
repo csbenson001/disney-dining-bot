@@ -1,8 +1,10 @@
 import base64
 import json
+import os
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import disney_bot
 import monitor
@@ -577,15 +579,24 @@ class OwnerScopedDeliveryTest(unittest.TestCase):
 
     def test_success_records_exact_watch_and_provider_metadata(self):
         posted = []
+        patched = []
 
         class Response:
             status_code = 201
             text = ""
 
+            def json(self):
+                return [{"id": 99}]
+
         supabase_pipe.is_supabase_enabled = lambda: True
         supabase_pipe._get_rows = lambda table, params: []
         original_post = supabase_pipe.requests.post
+        original_patch = supabase_pipe.requests.patch
         supabase_pipe.requests.post = lambda *args, **kwargs: (posted.append(kwargs["json"]) or Response())
+        supabase_pipe.requests.patch = lambda *args, **kwargs: (
+            patched.append(kwargs["json"])
+            or type("PatchResponse", (), {"status_code": 200, "text": ""})()
+        )
         try:
             receipt = DeliveryReceipt("+15550000001", "twilio", "queued", message_id="SM123")
             record_result = supabase_pipe.record_delivery_receipts(
@@ -595,13 +606,24 @@ class OwnerScopedDeliveryTest(unittest.TestCase):
             )
         finally:
             supabase_pipe.requests.post = original_post
+            supabase_pipe.requests.patch = original_patch
 
         self.assertEqual(record_result.inserted, 1)
+        self.assertEqual(record_result.delivery_records, 1)
         self.assertEqual(record_result.errors, [])
-        self.assertEqual(posted[0]["watch_id"], "watch_alice")
-        self.assertEqual(posted[0]["payload_json"]["delivery"], {
+        delivery_row = posted[0]
+        alert_row = posted[1]
+        self.assertEqual(alert_row["watch_id"], "watch_alice")
+        self.assertEqual(alert_row["payload_json"]["delivery"], {
             "provider": "twilio", "messageSid": "SM123", "providerStatus": "queued",
         })
+        self.assertEqual(delivery_row["user_id"], "alice")
+        self.assertEqual(delivery_row["watch_id"], "watch_alice")
+        self.assertIsNone(delivery_row["alert_id"])
+        self.assertEqual(patched, [{"alert_id": 99}])
+        self.assertEqual(delivery_row["provider_message_id"], "SM123")
+        self.assertEqual(delivery_row["destination_last4"], "0001")
+        self.assertNotIn("+15550000001", json.dumps(delivery_row))
 
     def test_delivery_receipt_dedupes_same_sid_but_records_new_sid(self):
         posts = []
@@ -617,7 +639,11 @@ class OwnerScopedDeliveryTest(unittest.TestCase):
             text = ""
 
         original_post = supabase_pipe.requests.post
+        original_patch = supabase_pipe.requests.patch
         supabase_pipe.requests.post = lambda *args, **kwargs: (posts.append(kwargs) or Response())
+        supabase_pipe.requests.patch = lambda *args, **kwargs: type(
+            "PatchResponse", (), {"status_code": 200, "text": ""}
+        )()
         try:
             duplicate_result = supabase_pipe.record_delivery_receipts(
                 [make_slot(owner_id="alice", watch_id="watch_alice", recipient_phone="+15550000001")],
@@ -631,10 +657,54 @@ class OwnerScopedDeliveryTest(unittest.TestCase):
             )
         finally:
             supabase_pipe.requests.post = original_post
+            supabase_pipe.requests.patch = original_patch
         self.assertEqual(duplicate_result.duplicates, 1)
         self.assertEqual(duplicate_result.inserted, 0)
         self.assertEqual(reopened_result.inserted, 1)
-        self.assertEqual(len(posts), 1)
+
+    def test_twilio_send_sets_configured_status_callback(self):
+        captured = []
+
+        class Messages:
+            def create(self, **kwargs):
+                captured.append(kwargs)
+                return type("Message", (), {"sid": "SM123", "status": "queued"})()
+
+        fake_client = type("Client", (), {"messages": Messages()})()
+        original_twilio = notify._twilio
+        notify._twilio = lambda: fake_client
+        try:
+            with patch.dict(os.environ, {
+                "TWILIO_MESSAGING_SERVICE_SID": "MG123",
+                "TWILIO_STATUS_CALLBACK_URL": "https://disscan.com/api/webhooks/twilio/status",
+            }):
+                receipt = notify._send_via_twilio("+15550000001", "hello", "sms")
+        finally:
+            notify._twilio = original_twilio
+        self.assertIsNone(receipt.error)
+        self.assertEqual(captured[0]["status_callback"], "https://disscan.com/api/webhooks/twilio/status")
+
+    def test_twilio_send_omits_status_callback_when_unconfigured(self):
+        captured = []
+
+        class Messages:
+            def create(self, **kwargs):
+                captured.append(kwargs)
+                return type("Message", (), {"sid": "SM123", "status": "queued"})()
+
+        fake_client = type("Client", (), {"messages": Messages()})()
+        original_twilio = notify._twilio
+        notify._twilio = lambda: fake_client
+        try:
+            with patch.dict(os.environ, {
+                "TWILIO_MESSAGING_SERVICE_SID": "MG123",
+                "TWILIO_STATUS_CALLBACK_URL": "",
+            }):
+                receipt = notify._send_via_twilio("+15550000001", "hello", "sms")
+        finally:
+            notify._twilio = original_twilio
+        self.assertIsNone(receipt.error)
+        self.assertNotIn("status_callback", captured[0])
 
     def test_receipt_persistence_failure_is_visible_without_resending_sms(self):
         notify._dispatch_with_receipt = lambda recipient, body: DeliveryReceipt(
@@ -647,6 +717,39 @@ class OwnerScopedDeliveryTest(unittest.TestCase):
         result = notify.send_sms([make_slot(recipient_phone="+15550000001")])
         self.assertEqual([slot.watch_id for slot in result.sent_slots], ["watch_abc"])
         self.assertIn("Delivery receipt persistence failed", result.errors[0])
+
+    def test_worker_receipt_retry_cannot_downgrade_existing_terminal_status(self):
+        calls = []
+
+        class Response:
+            status_code = 201
+            text = ""
+
+            def json(self):
+                return []
+
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe._get_rows = lambda table, params: [{"id": 99}] if table == "alerts" else []
+        original_post = supabase_pipe.requests.post
+        original_patch = supabase_pipe.requests.patch
+        supabase_pipe.requests.post = lambda *args, **kwargs: (calls.append((args, kwargs)) or Response())
+        supabase_pipe.requests.patch = lambda *args, **kwargs: type(
+            "PatchResponse", (), {"status_code": 200, "text": ""}
+        )()
+        try:
+            result = supabase_pipe.record_delivery_receipts(
+                [make_slot(owner_id="alice", watch_id="watch_alice", recipient_phone="+15550000001")],
+                booking_url,
+                DeliveryReceipt("+15550000001", "twilio", "queued", message_id="SM123"),
+            )
+        finally:
+            supabase_pipe.requests.post = original_post
+            supabase_pipe.requests.patch = original_patch
+        self.assertEqual(result.delivery_records, 1)
+        self.assertEqual(len(calls), 1)
+        _, delivery_kwargs = calls[0]
+        self.assertIn("resolution=ignore-duplicates", delivery_kwargs["headers"]["Prefer"])
+        self.assertEqual(delivery_kwargs["json"]["status"], "queued")
 
 
 if __name__ == "__main__":
