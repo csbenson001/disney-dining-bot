@@ -6,9 +6,11 @@ from datetime import datetime, timedelta, timezone
 
 import disney_bot
 import monitor
+import notify
+import supabase_pipe
 import watch_store
 from monitor import Slot
-from notify import _format_message, booking_url
+from notify import DeliveryReceipt, _format_message, booking_url
 
 
 def make_slot(**overrides):
@@ -400,6 +402,251 @@ class ScheduledActivityTest(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         types = sorted(g.get("booking_type") for g in groups)
         self.assertEqual(types, ["dining", "scheduled_activity"])
+
+
+class OwnerScopedDeliveryTest(unittest.TestCase):
+    def setUp(self):
+        self.original_get_rows = supabase_pipe._get_rows
+        self.original_entity = supabase_pipe._entity_for_reference
+        self.original_enabled = supabase_pipe.is_supabase_enabled
+        self.original_dispatch = notify._dispatch_with_receipt
+        self.original_record = getattr(supabase_pipe, "record_delivery_receipts")
+        self.original_sync = supabase_pipe.sync_plans_from_supabase
+        self.original_storage_read_json = watch_store.storage.read_json
+
+    def tearDown(self):
+        supabase_pipe._get_rows = self.original_get_rows
+        supabase_pipe._entity_for_reference = self.original_entity
+        supabase_pipe.is_supabase_enabled = self.original_enabled
+        notify._dispatch_with_receipt = self.original_dispatch
+        supabase_pipe.record_delivery_receipts = self.original_record
+        supabase_pipe.sync_plans_from_supabase = self.original_sync
+        watch_store.storage.read_json = self.original_storage_read_json
+
+    def test_supabase_sync_preserves_two_users_watch_ids_and_recipients(self):
+        watches = [
+            {
+                "id": "watch_alice", "user_id": "alice", "entity_id": "entity_a",
+                "threshold_json": {"kind": "ADR", "date": "2026-07-01", "party_size": 2},
+            },
+            {
+                "id": "watch_bob", "user_id": "bob", "entity_id": "entity_a",
+                "threshold_json": {"kind": "ADR", "date": "2026-07-01", "party_size": 2},
+            },
+        ]
+        phones = {"alice": "+15550000001", "bob": "+15550000002"}
+
+        def fake_get_rows(table, params):
+            if table == "watches":
+                return watches
+            if table == "users":
+                user_id = params["id"].removeprefix("eq.")
+                return [{"id": user_id, "phone_e164": phones[user_id]}]
+            return []
+
+        supabase_pipe._get_rows = fake_get_rows
+        supabase_pipe._entity_for_reference = lambda ref, name="": {
+            "id": "entity_a", "external_id": "90002606", "name": "'Ohana",
+            "booking_url": "https://disneyworld.disney.go.com/dine-res/restaurant/ohana/",
+        }
+        supabase_pipe.is_supabase_enabled = lambda: True
+
+        targets = supabase_pipe.sync_plans_from_supabase()
+        self.assertEqual(
+            {(t["owner_id"], t["watch_id"], t["recipient_phone"]) for t in targets},
+            {
+                ("alice", "watch_alice", "+15550000001"),
+                ("bob", "watch_bob", "+15550000002"),
+            },
+        )
+
+        raw_slot = make_slot(owner_id="", watch_id="", recipient_phone="")
+        watches_for_match = [
+            {
+                "owner_id": t["owner_id"], "watch_id": t["watch_id"],
+                "recipient_phone": t["recipient_phone"], "facility_id": t["facility_id"],
+                "date": t["dates"][0], "party_size": t["party_size"],
+                "meal_periods": t["meal_periods"], "slug": t["slug"],
+            }
+            for t in targets
+        ]
+        matched = disney_bot._matching_owner_slots([raw_slot], watches_for_match)
+        self.assertEqual(
+            {(s.owner_id, s.watch_id, s.recipient_phone) for s in matched},
+            {
+                ("alice", "watch_alice", "+15550000001"),
+                ("bob", "watch_bob", "+15550000002"),
+            },
+        )
+
+    def test_supabase_sync_refuses_missing_recipient_without_default_attribution(self):
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe._get_rows = lambda table, params: ([{
+            "id": "watch_orphan", "user_id": "orphan", "entity_id": "entity_a",
+            "threshold_json": {"kind": "ADR", "date": "2026-07-01"},
+        }] if table == "watches" else [])
+        supabase_pipe._entity_for_reference = lambda ref, name="": {
+            "id": "entity_a", "external_id": "90002606", "name": "'Ohana", "booking_url": "",
+        }
+        self.assertEqual(supabase_pipe.sync_plans_from_supabase(), [])
+
+    def test_malformed_watch_does_not_block_valid_owner_sync(self):
+        watches = [
+            {
+                "id": "watch_bad", "user_id": "bad", "entity_id": "entity_a",
+                "threshold_json": {"kind": "ADR", "date": "2026-07-01", "party_size": "many"},
+            },
+            {
+                "id": "watch_alice", "user_id": "alice", "entity_id": "entity_a",
+                "threshold_json": {"kind": "ADR", "date": "2026-07-01", "party_size": 2},
+            },
+        ]
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe._get_rows = lambda table, params: (
+            watches if table == "watches" else [{"id": "alice", "phone_e164": "+15550000001"}]
+        )
+        supabase_pipe._entity_for_reference = lambda ref, name="": {
+            "id": "entity_a", "external_id": "90002606", "name": "'Ohana", "booking_url": "",
+        }
+        targets = supabase_pipe.sync_plans_from_supabase()
+        self.assertEqual([(target["owner_id"], target["watch_id"]) for target in targets], [
+            ("alice", "watch_alice"),
+        ])
+
+    def test_owner_filtered_load_never_reintroduces_other_supabase_users(self):
+        watch_store.storage.read_json = lambda filename: []
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe.sync_plans_from_supabase = lambda: [
+            {
+                "watch_id": "watch_alice", "owner_id": "alice", "recipient_phone": "+15550000001",
+                "facility_id": "90002606", "name": "'Ohana", "slug": "ohana", "party_size": 2,
+                "meal_periods": ["DINNER"], "dates": ["2099-07-01"],
+            },
+            {
+                "watch_id": "watch_bob", "owner_id": "bob", "recipient_phone": "+15550000002",
+                "facility_id": "90002606", "name": "'Ohana", "slug": "ohana", "party_size": 2,
+                "meal_periods": ["DINNER"], "dates": ["2099-07-01"],
+            },
+        ]
+        watches = watch_store.load_watches(owner_id="alice", include_expired=True)
+        self.assertEqual([(watch["owner_id"], watch["watch_id"]) for watch in watches], [
+            ("alice", "watch_alice"),
+        ])
+
+    def test_failed_send_is_not_sent_or_recorded(self):
+        calls = []
+        notify._dispatch_with_receipt = lambda recipient, body: DeliveryReceipt(
+            recipient, "twilio", "failed", error="Twilio rejected"
+        )
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe.record_delivery_receipts = lambda *args: calls.append(args)
+
+        result = notify.send_sms([make_slot(recipient_phone="+15550000001")])
+        self.assertEqual(result.sent_slots, [])
+        self.assertEqual(result.receipts, [])
+        self.assertEqual(calls, [])
+        self.assertIn("Twilio rejected", result.errors)
+
+    def test_missing_recipient_is_visible_and_never_falls_back(self):
+        dispatched = []
+        notify._dispatch_with_receipt = lambda recipient, body: (
+            dispatched.append(recipient)
+            or DeliveryReceipt(recipient, "twilio", "queued", message_id="SM123")
+        )
+        supabase_pipe.is_supabase_enabled = lambda: False
+        result = notify.send_sms([
+            make_slot(owner_id="alice", watch_id="watch_alice", recipient_phone="+15550000001"),
+            make_slot(owner_id="bob", watch_id="watch_bob", recipient_phone="", time="20:55"),
+        ])
+        self.assertEqual(dispatched, ["+15550000001"])
+        self.assertEqual([slot.watch_id for slot in result.sent_slots], ["watch_alice"])
+        self.assertIn("No recipient phone configured for watch watch_bob", result.errors)
+
+    def test_terminal_provider_failure_without_exception_remains_retryable(self):
+        recorded = []
+        notify._dispatch_with_receipt = lambda recipient, body: DeliveryReceipt(
+            recipient, "twilio", "undelivered", message_id="SM_failed"
+        )
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe.record_delivery_receipts = lambda *args: recorded.append(args)
+        result = notify.send_sms([make_slot(recipient_phone="+15550000001")])
+        self.assertEqual(result.sent_slots, [])
+        self.assertEqual(result.receipts, [])
+        self.assertEqual(recorded, [])
+        self.assertIn("twilio reported undelivered", result.errors[0])
+
+    def test_success_records_exact_watch_and_provider_metadata(self):
+        posted = []
+
+        class Response:
+            status_code = 201
+            text = ""
+
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe._get_rows = lambda table, params: []
+        original_post = supabase_pipe.requests.post
+        supabase_pipe.requests.post = lambda *args, **kwargs: (posted.append(kwargs["json"]) or Response())
+        try:
+            receipt = DeliveryReceipt("+15550000001", "twilio", "queued", message_id="SM123")
+            record_result = supabase_pipe.record_delivery_receipts(
+                [make_slot(owner_id="alice", watch_id="watch_alice", recipient_phone="+15550000001")],
+                booking_url,
+                receipt,
+            )
+        finally:
+            supabase_pipe.requests.post = original_post
+
+        self.assertEqual(record_result.inserted, 1)
+        self.assertEqual(record_result.errors, [])
+        self.assertEqual(posted[0]["watch_id"], "watch_alice")
+        self.assertEqual(posted[0]["payload_json"]["delivery"], {
+            "provider": "twilio", "messageSid": "SM123", "providerStatus": "queued",
+        })
+
+    def test_delivery_receipt_dedupes_same_sid_but_records_new_sid(self):
+        posts = []
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe._get_rows = lambda table, params: (
+            [{"id": 42}]
+            if table == "alerts" and params.get("payload_json->delivery->>messageSid") == "eq.SM123"
+            else []
+        )
+
+        class Response:
+            status_code = 201
+            text = ""
+
+        original_post = supabase_pipe.requests.post
+        supabase_pipe.requests.post = lambda *args, **kwargs: (posts.append(kwargs) or Response())
+        try:
+            duplicate_result = supabase_pipe.record_delivery_receipts(
+                [make_slot(owner_id="alice", watch_id="watch_alice", recipient_phone="+15550000001")],
+                booking_url,
+                DeliveryReceipt("+15550000001", "twilio", "queued", message_id="SM123"),
+            )
+            reopened_result = supabase_pipe.record_delivery_receipts(
+                [make_slot(owner_id="alice", watch_id="watch_alice", recipient_phone="+15550000001")],
+                booking_url,
+                DeliveryReceipt("+15550000001", "twilio", "queued", message_id="SM456"),
+            )
+        finally:
+            supabase_pipe.requests.post = original_post
+        self.assertEqual(duplicate_result.duplicates, 1)
+        self.assertEqual(duplicate_result.inserted, 0)
+        self.assertEqual(reopened_result.inserted, 1)
+        self.assertEqual(len(posts), 1)
+
+    def test_receipt_persistence_failure_is_visible_without_resending_sms(self):
+        notify._dispatch_with_receipt = lambda recipient, body: DeliveryReceipt(
+            recipient, "twilio", "queued", message_id="SM123"
+        )
+        supabase_pipe.is_supabase_enabled = lambda: True
+        supabase_pipe.record_delivery_receipts = lambda *args: supabase_pipe.ReceiptRecordResult(
+            errors=["watch watch_abc receipt insert returned 500"]
+        )
+        result = notify.send_sms([make_slot(recipient_phone="+15550000001")])
+        self.assertEqual([slot.watch_id for slot in result.sent_slots], ["watch_abc"])
+        self.assertIn("Delivery receipt persistence failed", result.errors[0])
 
 
 if __name__ == "__main__":

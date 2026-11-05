@@ -183,18 +183,30 @@ def load_watches(owner_id: Optional[str] = None, include_expired: bool = False) 
         import supabase_pipe
         if supabase_pipe.is_supabase_enabled():
             for target in supabase_pipe.sync_plans_from_supabase():
+                if owner_id and target["owner_id"] != owner_id:
+                    continue
                 for d in target.get("dates", []):
                     w_norm = _normalize_watch({
-                        "owner_id": default_owner_id(),
+                        "watch_id": target["watch_id"],
+                        "owner_id": target["owner_id"],
                         "facility_id": target["facility_id"],
                         "name": target.get("name"),
                         "slug": target.get("slug"),
                         "party_size": target.get("party_size", 2),
                         "meal_periods": target.get("meal_periods", ["ALL"]),
                         "date": d,
+                        "recipient_phone": target["recipient_phone"],
                     })
-                    if not any(w["facility_id"] == w_norm["facility_id"] and w["date"] == w_norm["date"] and w["party_size"] == w_norm["party_size"] for w in watches):
+                    existing_index = next((
+                        index for index, watch in enumerate(watches)
+                        if watch["watch_id"] == w_norm["watch_id"]
+                        and watch["facility_id"] == w_norm["facility_id"]
+                        and watch["date"] == w_norm["date"]
+                    ), None)
+                    if existing_index is None:
                         watches.append(w_norm)
+                    else:
+                        watches[existing_index] = w_norm
     except Exception as exc:
         print(f'[watch_store] Supabase plan sync failed: {exc}')
 
