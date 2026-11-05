@@ -5,6 +5,7 @@ Inspect Friends & Family list using headed Chrome with .coach_profile.
 
 from pathlib import Path
 import json
+import os
 import time
 from playwright.sync_api import sync_playwright
 
@@ -44,18 +45,18 @@ with sync_playwright() as p:
 
     page.screenshot(path=str(screenshots_dir / "friends_list_headed.png"))
 
-    # Extract all text on the page
-    txt = page.locator("body").inner_text()
-    print("\n--- Friends Page Content Snippets ---")
-    for line in [l.strip() for l in txt.splitlines() if l.strip()]:
-        if any(w in line.lower() for w in ["friend", "family", "plan", "benson", "chris", "share", "party", "invite", "manage"]):
-            print("  *", line)
-
     if captured_data:
-        out = Path(__file__).parent.parent / "friends_api_data.json"
+        configured_path = os.environ.get("DISNEY_FRIENDS_DATA_PATH", "").strip()
+        if not configured_path:
+            raise RuntimeError("Set DISNEY_FRIENDS_DATA_PATH to a protected path outside the repository")
+        out = Path(configured_path).expanduser().resolve()
+        repository_root = Path(__file__).parent.parent.resolve()
+        if out == repository_root or repository_root in out.parents:
+            raise RuntimeError("DISNEY_FRIENDS_DATA_PATH must be outside the repository")
+        out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         out.write_text(json.dumps(captured_data, indent=2))
-        print(f"\n[Saved {len(captured_data)} captured API responses to friends_api_data.json]")
+        out.chmod(0o600)
+        print(f"\n[Saved {len(captured_data)} captured API responses to protected runtime storage]")
 
     context.close()
     print("Done!")
-

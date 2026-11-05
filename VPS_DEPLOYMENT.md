@@ -150,11 +150,44 @@ pbpaste | python3 scripts/sync_disney_login_to_vps.py --password-stdin
 Then SSH with a TTY and run the seeder so you can interact with the browser:
 
 ```bash
-ssh -t -i ~/.ssh/disney_dining_vps root@107.170.35.91 'cd /opt/disney-dining-bot && . .venv/bin/activate && DISNEY_HEADLESS=false xvfb-run -a python3 seed_disney_session.py'
+ssh -t -i ~/.ssh/disney_dining_vps root@${DISNEY_VPS_HOST} 'cd /opt/disney-dining-bot && . .venv/bin/activate && DISNEY_HEADLESS=false xvfb-run -a python3 seed_disney_session.py'
 ```
 
 The script attempts the login, navigates to a dining page, and verifies the
 Disney auth cookie via `_fill_first_any_frame`.
+
+Autobook party resolution also requires a protected Friends & Family capture.
+Keep it outside the Git checkout because it contains private account and guest
+data. Before updating a deployment that previously stored `friends_api_data.json`
+in the repository, move that file into root-only runtime storage and add this
+path to the VPS `.env`:
+
+```bash
+install -d -m 0700 /var/lib/disney-dining-bot
+install -m 0600 /opt/disney-dining-bot/friends_api_data.json \
+  /var/lib/disney-dining-bot/friends_api_data.json
+printf '%s\n' 'DISNEY_FRIENDS_DATA_PATH=/var/lib/disney-dining-bot/friends_api_data.json' >> /opt/disney-dining-bot/.env
+```
+
+If there is no existing capture, regenerate it interactively after setting
+`DISNEY_FRIENDS_DATA_PATH` in the environment:
+
+```bash
+cd /opt/disney-dining-bot
+. .venv/bin/activate
+set -a; . ./.env; set +a
+xvfb-run -a python3 scripts/inspect_friends_headed.py
+```
+
+Verify the capture is outside the checkout, owned by the service account, and
+readable only by that account before enabling autobook:
+
+```bash
+case "$DISNEY_FRIENDS_DATA_PATH" in /opt/disney-dining-bot/*) exit 1;; esac
+test "$(stat -c '%U' "$DISNEY_FRIENDS_DATA_PATH")" = root
+test "$(stat -c '%a' "$DISNEY_FRIENDS_DATA_PATH")" = 600
+python3 -c 'import autobook_service; print(len(autobook_service.get_party_roster()))'
+```
 
 ## 7. Alert State Safety
 

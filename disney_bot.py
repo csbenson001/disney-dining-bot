@@ -171,10 +171,7 @@ def send_session_expired_alert(owner_phones: list[str]) -> None:
 
     message = (
         "Disney Dining Bot: Disney login session failed after automatic recovery.\n"
-        "Manual re-seed required. On a machine with your SSH key:\n"
-        "ssh -i ~/.ssh/disney_dining_vps -t root@107.170.35.91 "
-        "'cd /opt/disney-dining-bot && . .venv/bin/activate && "
-        "DISNEY_HEADLESS=false xvfb-run -a python3 seed_disney_session.py'"
+        "Manual re-seed required. Follow the protected operations runbook."
     )
 
     errors = send_operational_sms(owner_phones, message)

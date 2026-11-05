@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dedicated session seeder for WDW Ride Coach (wdwridecoach@gmail.com).
+Dedicated session seeder for the WDW Ride Coach account.
 Logs into Disney, captures auth cookies/JWT tokens, and inspects linked party.
 """
 
@@ -84,12 +84,15 @@ def _dismiss_overlays(page):
 def main():
     parser = argparse.ArgumentParser(description="Seed Disney session for Coach account")
     parser.add_argument("--headless", action="store_true", default=False, help="Run browser in headless mode")
-    parser.add_argument("--email", default=os.environ.get("DISNEY_LOGIN_EMAIL", "wdwridecoach@gmail.com"))
-    parser.add_argument("--password", default=os.environ.get("DISNEY_LOGIN_PASSWORD", "Christo123!"))
+    parser.add_argument("--email", default=os.environ.get("DISNEY_LOGIN_EMAIL", ""))
+    parser.add_argument("--password", default=os.environ.get("DISNEY_LOGIN_PASSWORD", ""))
     parser.add_argument("--profile-dir", default=str(Path(__file__).parent / ".coach_profile"))
     parser.add_argument("--timeout-sec", type=int, default=120, help="Max seconds to wait for login completion")
     parser.add_argument("--otp", default=None, help="6-digit verification code sent to email")
     args = parser.parse_args()
+
+    if not args.email or not args.password:
+        parser.error("Disney login credentials are required via arguments or environment variables")
 
     print(f"=== WDW Ride Coach Disney Authenticator ===")
     print(f"Target Account: {args.email}")

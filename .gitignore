@@ -14,3 +14,6 @@ venv/
 .cache/
 .coach_profile/
 screenshots/
+# Runtime Disney API capture. Contains account/session data and must never be committed.
+friends_api_data.json
+friends_api_data*.json
