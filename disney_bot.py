@@ -554,6 +554,16 @@ def poll(config: Optional[dict] = None) -> None:
 
 # ── entry point ────────────────────────────────────────────────────────────
 
+def poll_cycle(config: Optional[dict] = None) -> None:
+    """Finish alert work before serializing one independent calendar request."""
+    poll(config)
+    from calendar_worker import process_pending_calendar_request
+
+    result = process_pending_calendar_request()
+    if result.get("processed") or result.get("status") == "persistence_failed":
+        print(f"[calendar] {result.get('status')}; processed={result.get('processed', 0)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Disney dining availability monitor")
     parser.add_argument(
@@ -566,13 +576,13 @@ def main() -> None:
     interval = int(config.get("polling_interval_minutes", 10))
 
     if args.once:
-        poll(config)
+        poll_cycle(config)
         return
 
     print(f"[bot] Starting — polling every {interval} minute(s).  Ctrl-C to stop.")
-    poll(config)  # immediate first check
+    poll_cycle(config)  # immediate first check
 
-    schedule.every(interval).minutes.do(poll, config=config)
+    schedule.every(interval).minutes.do(poll_cycle, config=config)
     try:
         while True:
             schedule.run_pending()
