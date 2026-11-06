@@ -704,6 +704,63 @@ def check_slots_via_playwright(restaurant: dict) -> List[Slot]:
     return slots
 
 
+def fetch_calendar_availability_via_playwright(
+    *, facility_id: str, slug: str, party_size: int, start_date: str, end_date: str,
+) -> dict:
+    """Fetch raw all-meal inventory for a separate calendar receipt.
+
+    The caller validates coverage and stores normalized observations. HTTP 404
+    remains a failure status. No watch or notification state is changed here.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            _playwright_profile_dir(), headless=_playwright_headless(),
+            args=["--no-sandbox"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto(
+                f"https://disneyworld.disney.go.com/dine-res/restaurant/{slug}",
+                wait_until="domcontentloaded", timeout=45000,
+            )
+            page.wait_for_timeout(int(os.environ.get("DISNEY_AKAMAI_WARMUP_MS", "8000")))
+            token = _token_from_playwright_context(context)
+            fetch_timeout_ms = int(os.environ.get("DISNEY_CALENDAR_FETCH_TIMEOUT_MS", "30000"))
+            return page.evaluate(
+                """async ({partySize, start, end, facilityId, token, fetchTimeoutMs}) => {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
+                  try {
+                    const resp = await fetch(
+                      `/dine-res/api/availability/${partySize}/${start},${end}?facilityId=${facilityId}&entityType=restaurant`,
+                      { headers: {
+                        'Authorization': token,
+                        'x-function-name': 'getAvailability',
+                        'x-disney-internal-dine-vas-365': 'true',
+                        'x-disney-internal-dine-vas-eks': 'true',
+                        'accept': 'application/json, text/plain, */*',
+                      }, signal: controller.signal}
+                    );
+                    return {
+                      status: resp.status,
+                      data: resp.status === 200 ? await resp.json() : null,
+                      request_id: resp.headers.get('x-request-id') || resp.headers.get('x-correlation-id') || null,
+                    };
+                  } catch (e) {
+                    return {status: 0, data: null};
+                  } finally {
+                    clearTimeout(timer);
+                  }
+                }""",
+                {"partySize": party_size, "start": start_date, "end": end_date,
+                 "facilityId": facility_id, "token": token, "fetchTimeoutMs": fetch_timeout_ms},
+            )
+        finally:
+            context.close()
+
+
 def get_calendar_days_via_playwright(facility_id: str, slug: str) -> List[str]:
     """Fetch calendar availability using the same VPS Playwright browser profile."""
     try:
